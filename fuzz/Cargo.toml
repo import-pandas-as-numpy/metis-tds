@@ -1,0 +1,44 @@
+[package]
+name = "metis-tds-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.10"
+metis-tds = { path = "..", version = "=0.1.0" }
+
+[[bin]]
+name = "packet"
+path = "fuzz_targets/packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "prelogin"
+path = "fuzz_targets/prelogin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "login7"
+path = "fuzz_targets/login7.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tokens"
+path = "fuzz_targets/tokens.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

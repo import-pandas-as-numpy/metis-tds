@@ -1,0 +1,60 @@
+# Metis TDS honeypot
+
+Metis is a contained Microsoft SQL Server TDS 7.x honeypot. It accepts real TDS connections, records login and request telemetry, classifies attacker intent, and returns synthetic SQL Server responses. It never executes submitted SQL, commands, assemblies, paths, or network destinations.
+
+The detailed requirements are in `mssql-tds-honeypot-spec.md`; verified progress and compatibility evidence are in `IMPLEMENTATION_LOG.md`.
+
+Protocol behavior is implemented from Microsoft's current MS-TDS open specification. The project supports bounded multi-packet framing, TDS 7.4 PRELOGIN/LOGIN7, TDS-wrapped TLS 1.2/1.3, SQL batches, common RPC parameters, stateful attacker-oriented semantics, synthetic result sets, JSONL telemetry, and bounded payload capture.
+
+## Safety boundary
+
+Run this as an unprivileged, isolated service with outbound traffic denied. The runtime intentionally contains no subprocess or generic command-execution facility. Submitted binary material is bounded, hashed, and stored under generated names with mode `0600` when payload capture is enabled.
+
+## Quick start
+
+```console
+cargo build --release --locked
+cp config/example.json config/local.json
+./target/release/metis-tds --config config/local.json
+```
+
+The example binds to `127.0.0.1:1433` to avoid accidental exposure. Change the address only after applying the deployment controls in `docs/deployment.md`.
+
+TLS certificate conversion, systemd hardening, outbound-deny guidance, and Internet-indexing caveats are in `docs/deployment.md`.
+
+## Container
+
+Build and run the production image with:
+
+```console
+docker build -t metis-tds .
+docker run --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+  --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+  --mount type=bind,src="$PWD/config/local.json",dst=/etc/metis-tds/config.json,readonly \
+  --mount type=volume,src=metis-tds-data,dst=/var/lib/metis-tds \
+  --mount type=volume,src=metis-tds-logs,dst=/var/log/metis-tds \
+  -p 1433:1433 metis-tds
+```
+
+The image does not contain a deployment configuration. Supply one at runtime at `/etc/metis-tds/config.json`; for container networking its `listener.address` must use `0.0.0.0:1433`. Keep telemetry and captured-payload paths in the mounted data volumes. For an Internet-facing deployment, enable TLS and enforce outbound denial at the container or host network boundary.
+
+## Verification
+
+```console
+cargo test --all-targets --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo deny check
+cargo deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check
+```
+
+The test suite includes a standalone protocol client plus independent Tiberius client flows for plaintext SQL batch/RPC and required TLS. `sqlcmd`, SSMS, FreeTDS, Impacket, Censys, and Shodan remain unclaimed until they have been exercised against a deployed instance; see the compatibility ledger.
+
+Coverage-guided fuzz targets are isolated from the production dependency graph under `fuzz/`. They require nightly Rust and `cargo-fuzz 0.13.2`:
+
+```console
+for target in packet prelogin login7 tokens; do
+  cargo +nightly fuzz run "$target" -- -runs=100000 -max_len=65536 -timeout=5
+done
+```
+
+The corpus directories are intentionally retained. On ptrace-restricted hosts where LeakSanitizer cannot perform its final process scan, build with `cargo +nightly fuzz build` and run the generated ASan-instrumented target with `ASAN_OPTIONS=detect_leaks=0`; do not disable AddressSanitizer itself.

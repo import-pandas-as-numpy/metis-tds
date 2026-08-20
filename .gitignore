@@ -1,0 +1,27 @@
+# Rust build output
+/target/
+/fuzz/target/
+
+# Runtime data
+*.jsonl
+/payloads/
+
+# Local configuration and secrets
+/config/*.json
+!/config/example.json
+.env
+.env.*
+!.env.example
+*.crt
+*.der
+*.key
+*.p12
+*.pem
+*.pfx
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

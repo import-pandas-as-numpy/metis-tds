@@ -1,0 +1,54 @@
+{
+  "listener": {
+    "address": "127.0.0.1:1433",
+    "max_connections": 256,
+    "max_connections_per_ip": 20,
+    "login_timeout_seconds": 15,
+    "idle_timeout_seconds": 300,
+    "max_session_seconds": 3600
+  },
+  "tls": {
+    "mode": "disabled",
+    "certificate_der": null,
+    "private_key_der": null
+  },
+  "limits": {
+    "max_packet_bytes": 32768,
+    "max_message_bytes": 8388608,
+    "max_sql_batch_bytes": 1048576,
+    "max_rpc_parameter_bytes": 1048576,
+    "max_payload_bytes": 16777216,
+    "max_requests_per_session": 10000,
+    "max_requests_per_minute_per_ip": 1200,
+    "telemetry_queue_capacity": 8192
+  },
+  "telemetry": {
+    "jsonl_path": "events.jsonl",
+    "stdout": true
+  },
+  "payloads": {
+    "enabled": true,
+    "directory": "payloads"
+  },
+  "personality": {
+    "server_name": "SQL-FIN-01",
+    "instance_name": "MSSQLSERVER",
+    "sql_version": "Microsoft SQL Server 2022 (RTM-CU18) (KB5050771) - 16.0.4185.3 (X64)",
+    "product_version": "16.0.4185.3",
+    "product_level": "RTM",
+    "edition": "Enterprise Edition (64-bit)",
+    "os_version": "Windows Server 2022 Datacenter 10.0 (Build 20348)",
+    "domain": "CORP",
+    "default_database": "master",
+    "language": "us_english",
+    "accept_unknown_logins": true,
+    "unknown_query_behavior": "empty",
+    "databases": ["master", "tempdb", "model", "msdb", "Finance", "Payroll", "Reporting"],
+    "logins": [
+      {"name": "sa", "password": "ChangeMe-NotARealSecret!", "locked": false, "honey": false},
+      {"name": "CORP\\svc_legacybackup", "password": null, "locked": false, "honey": true}
+    ],
+    "linked_servers": ["SQL-REPORT-01"],
+    "honey_objects": ["LegacyPayrollArchive.dbo.DomainAdminCredentials", "dbo.usp_DecryptPasswords"]
+  }
+}
