@@ -1,0 +1,21 @@
+[Unit]
+Description=Metis Microsoft SQL Server TDS honeypot container
+After=network-online.target nftables.service
+Wants=network-online.target
+Requires=nftables.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+TimeoutStartSec=90
+TimeoutStopSec=30
+UMask=0077
+ExecStartPre=/usr/bin/podman image exists localhost/metis-tds:deploy
+ExecStartPre=-/usr/bin/podman rm --force metis-tds
+ExecStart=/usr/bin/podman run --name metis-tds --pull=never --network host --read-only --cap-drop=all --security-opt=no-new-privileges --pids-limit=256 --memory=384m --cpus=0.75 --tmpfs=/tmp:rw,noexec,nosuid,nodev,size=16m --volume=/etc/metis-tds:/etc/metis-tds:ro --volume=/var/lib/metis-tds:/var/lib/metis-tds:rw --volume=/var/log/metis-tds:/var/log/metis-tds:rw --log-driver=journald localhost/metis-tds:deploy
+ExecStop=/usr/bin/podman stop --time 10 metis-tds
+ExecStopPost=-/usr/bin/podman rm --force metis-tds
+
+[Install]
+WantedBy=multi-user.target
