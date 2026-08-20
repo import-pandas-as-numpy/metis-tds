@@ -42,13 +42,16 @@ Enforce outbound denial outside the process. For example, with nftables and a de
 table inet metis_honeypot {
     chain output {
         type filter hook output priority 0; policy accept;
+        meta skuid "metis-tds" ct state established,related accept
         meta skuid "metis-tds" oifname "lo" accept
         meta skuid "metis-tds" counter drop
     }
 }
 ```
 
-Adjust loopback policy if telemetry is sent to a local collector. The current application itself has no outbound connector, resolver, subprocess, SQL engine, or command-execution backend.
+The connection-tracking rule is required so the service can answer inbound clients without gaining permission to initiate a connection. Adjust loopback policy if telemetry is sent to a local collector. The current application itself has no outbound connector, resolver, subprocess, SQL engine, or command-execution backend.
+
+For the container image, use `deploy/nftables-container.conf`. It applies the same policy to the image's numeric runtime UID, `65532`.
 
 ## systemd
 
@@ -61,6 +64,18 @@ sudo systemctl status metis-tds
 ```
 
 Keep the configuration and TLS files read-only to the service. Only the log and payload directories should be writable. Do not mount a Docker socket, cloud credentials, package-manager credentials, domain credentials, or production files into the boundary.
+
+## OCI artifact on an isolated VPS
+
+The `Build deployment image` workflow creates a Linux/amd64 OCI archive as a short-lived GitHub Actions artifact. This provides a deployment path for hosts that should not receive repository or registry credentials:
+
+1. Run the workflow against the exact revision to deploy and download `metis-tds.oci.tar` on a trusted workstation.
+2. Verify its checksum, copy only the archive and deployment configuration to the VPS, and import it with `podman load --input metis-tds.oci.tar`.
+3. Tag the imported image as `localhost/metis-tds:deploy`, then delete the transferred archive from the VPS.
+4. Install `deploy/nftables-container.conf` as `/etc/nftables.conf`, `deploy/metis-tds-container.service` as `/etc/systemd/system/metis-tds.service`, and `deploy/metis-tds.logrotate` as `/etc/logrotate.d/metis-tds`. The nftables file owns the host ruleset; merge its table into the existing policy instead if the host already has local firewall rules.
+5. Mount the chosen configuration and freshly generated decoy TLS material under `/etc/metis-tds`; neither is baked into the image.
+
+The container unit uses host networking so the host can filter new outbound traffic by UID. It also uses a read-only root filesystem, no capabilities, no-new-privileges, bounded CPU/memory/PIDs, and no container-runtime socket. `--pull=never` guarantees service restarts use the imported image without contacting a registry.
 
 ## Internet indexing
 
