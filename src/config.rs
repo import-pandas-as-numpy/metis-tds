@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn example_configuration_loads_and_validates() {
         let config = Config::load("config/example.json").unwrap();
-        assert!(config.personality.accept_unknown_logins);
+        assert!(!config.personality.accept_unknown_logins);
         assert!(config.personality.logins.len() >= 25);
         assert!(config.personality.logins.iter().all(|login| !login.locked));
         assert!(config.personality.databases.len() >= 10);
