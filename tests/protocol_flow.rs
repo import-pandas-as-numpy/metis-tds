@@ -9,7 +9,11 @@ use metis_tds::{
         prelogin::{Encryption, encode_response},
     },
 };
-use tokio::net::{TcpListener, TcpStream};
+use serde_json::Value;
+use tokio::{
+    io::AsyncWriteExt,
+    net::{TcpListener, TcpStream},
+};
 
 #[tokio::test]
 async fn plaintext_login_and_discovery_query_complete() {
@@ -98,6 +102,86 @@ async fn rejected_login_never_echoes_password() {
     let failure = read_message(&mut client, 4096, 65_536).await.unwrap();
     assert_eq!(failure.payload.first(), Some(&0xaa));
     assert!(!contains_utf16(&failure.payload, "SuperSecret!"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn malformed_packet_reports_source_stage_error_and_wire_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let telemetry_path = temp.path().join("events.jsonl");
+    let mut config = Config::default();
+    config.listener.address = "127.0.0.1:0".into();
+    config.telemetry.jsonl_path = Some(telemetry_path.to_string_lossy().into_owned());
+    config.telemetry.stdout = false;
+    config.payloads.enabled = false;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(Server::new(config).await.unwrap().serve(listener, false));
+
+    let mut client = TcpStream::connect(address).await.unwrap();
+    let malformed = [
+        tds::PRELOGIN,
+        0,
+        0,
+        9,
+        0,
+        0,
+        0,
+        0,
+        0,
+        tds::PRELOGIN,
+        1,
+        0,
+        9,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    client.write_all(&malformed).await.unwrap();
+    drop(client);
+
+    let mut events = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        events = std::fs::read_to_string(&telemetry_path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect();
+        if events
+            .iter()
+            .any(|event| event["event_type"] == "connection_close")
+        {
+            break;
+        }
+    }
+
+    let malformed_event = events
+        .iter()
+        .find(|event| event["event_type"] == "malformed_tds_message")
+        .expect("dedicated malformed event");
+    assert_eq!(malformed_event["source_ip"], "127.0.0.1");
+    assert_eq!(malformed_event["protocol_stage"], "prelogin_read");
+    assert_eq!(malformed_event["error_kind"], "protocol");
+    assert_eq!(malformed_event["bytes_read"], malformed.len() - 1);
+    assert!(
+        malformed_event["error"]
+            .as_str()
+            .unwrap()
+            .contains("unexpected TDS packet id")
+    );
+
+    let close = events
+        .iter()
+        .find(|event| event["event_type"] == "connection_close")
+        .expect("connection close event");
+    assert_eq!(close["source_ip"], "127.0.0.1");
+    assert_eq!(close["protocol_stage"], "prelogin_read");
+    assert_eq!(close["error_kind"], "protocol");
+    assert_eq!(close["parser_errors"], 1);
+    assert_eq!(close["bytes_read"], malformed.len() - 1);
     task.abort();
 }
 

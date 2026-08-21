@@ -18,4 +18,18 @@ pub enum Error {
     Json(#[from] serde_json::Error),
 }
 
+impl Error {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Config(_) => "configuration",
+            Self::Protocol(_) => "protocol",
+            Self::Limit(_) => "limit",
+            Self::Authentication => "authentication",
+            Self::Tls(_) => "tls",
+            Self::Io(_) => "io",
+            Self::Json(_) => "json",
+        }
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;

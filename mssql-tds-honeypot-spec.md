@@ -762,10 +762,31 @@ Capture:
 - connection/session ID
 - storage reference
 
-### 15.7 Connection Close
+### 15.7 Malformed TDS Event
+
+```json
+{
+  "event_type": "malformed_tds_message",
+  "connection_id": "...",
+  "source_ip": "...",
+  "source_port": 50041,
+  "protocol_stage": "login_parse",
+  "error_kind": "protocol",
+  "error": "TDS protocol error: LOGIN7 fixed header is truncated",
+  "bytes_read": 31,
+  "bytes_written": 47
+}
+```
+
+Do not include raw LOGIN7 bytes or password material in parser-error telemetry.
+
+### 15.8 Connection Close
 
 Capture:
 
+- source IP and port
+- last protocol stage
+- structured error kind
 - session duration
 - request count
 - bytes read/written
