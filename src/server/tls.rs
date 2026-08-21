@@ -13,7 +13,6 @@ use rustls::{
 use tokio::{
     fs,
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
-    net::TcpStream,
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
@@ -51,7 +50,10 @@ async fn read_bounded(path: impl AsRef<Path>, max: u64) -> Result<Vec<u8>> {
     Ok(fs::read(path).await?)
 }
 
-pub async fn handshake(stream: TcpStream, acceptor: &TlsAcceptor) -> Result<TlsStream<TdsTlsIo>> {
+pub async fn handshake<S>(stream: S, acceptor: &TlsAcceptor) -> Result<TlsStream<TdsTlsIo<S>>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut tls = acceptor
         .accept(TdsTlsIo::new(stream))
         .await
@@ -63,8 +65,8 @@ pub async fn handshake(stream: TcpStream, acceptor: &TlsAcceptor) -> Result<TlsS
 
 /// Adapts TLS handshake bytes to SQL Server's PRELOGIN packet encapsulation.
 /// After the handshake, it switches to raw TCP so rustls carries complete TDS messages.
-pub struct TdsTlsIo {
-    inner: TcpStream,
+pub struct TdsTlsIo<S> {
+    inner: S,
     raw_read: bool,
     raw_write: bool,
     handshake_messages_read: u8,
@@ -79,8 +81,8 @@ pub struct TdsTlsIo {
     accepted_write_len: usize,
 }
 
-impl TdsTlsIo {
-    fn new(inner: TcpStream) -> Self {
+impl<S> TdsTlsIo<S> {
+    fn new(inner: S) -> Self {
         Self {
             inner,
             raw_read: false,
@@ -110,7 +112,9 @@ impl TdsTlsIo {
         self.pending_write_pos = 0;
         self.accepted_write_len = 0;
     }
+}
 
+impl<S: AsyncWrite + Unpin> TdsTlsIo<S> {
     fn poll_pending_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.pending_write_pos < self.pending_write.len() {
             match Pin::new(&mut self.inner)
@@ -126,7 +130,7 @@ impl TdsTlsIo {
     }
 }
 
-impl AsyncRead for TdsTlsIo {
+impl<S: AsyncRead + Unpin> AsyncRead for TdsTlsIo<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -226,7 +230,7 @@ impl AsyncRead for TdsTlsIo {
     }
 }
 
-impl AsyncWrite for TdsTlsIo {
+impl<S: AsyncWrite + Unpin> AsyncWrite for TdsTlsIo<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,

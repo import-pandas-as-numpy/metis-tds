@@ -1,10 +1,15 @@
 use std::{
     net::SocketAddr,
-    sync::{Arc, atomic::Ordering},
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::{Context, Poll},
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
     time::{Instant as TokioInstant, timeout, timeout_at},
 };
@@ -29,6 +34,7 @@ use super::{Shared, tls};
 
 pub struct Summary {
     pub reason: String,
+    pub stage: &'static str,
     pub session_id: Option<u32>,
     pub requests: u64,
     pub bytes_read: u64,
@@ -37,31 +43,145 @@ pub struct Summary {
     pub highest_risk: String,
 }
 
-struct Counters {
-    bytes_read: u64,
-    bytes_written: u64,
-    parser_errors: u64,
-    highest_risk: Classification,
+pub struct Failure {
+    pub error: Error,
+    pub stage: &'static str,
+    pub session_id: Option<u32>,
+    pub requests: u64,
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+    pub highest_risk: String,
 }
-impl Default for Counters {
-    fn default() -> Self {
+
+#[derive(Default)]
+struct WireCounters {
+    bytes_read: AtomicU64,
+    bytes_written: AtomicU64,
+}
+
+struct Progress {
+    stage: &'static str,
+    session_id: Option<u32>,
+    requests: u64,
+    highest_risk: Classification,
+    wire: Arc<WireCounters>,
+}
+
+impl Progress {
+    fn new(wire: Arc<WireCounters>) -> Self {
         Self {
-            bytes_read: 0,
-            bytes_written: 0,
-            parser_errors: 0,
+            stage: "connection_setup",
+            session_id: None,
+            requests: 0,
             highest_risk: Classification::Unknown,
+            wire,
         }
+    }
+
+    fn summary(&self, reason: &str) -> Summary {
+        Summary {
+            reason: reason.into(),
+            stage: self.stage,
+            session_id: self.session_id,
+            requests: self.requests,
+            bytes_read: self.wire.bytes_read.load(Ordering::Relaxed),
+            bytes_written: self.wire.bytes_written.load(Ordering::Relaxed),
+            parser_errors: 0,
+            highest_risk: format!("{:?}", self.highest_risk).to_lowercase(),
+        }
+    }
+
+    fn failure(&self, error: Error) -> Failure {
+        Failure {
+            error,
+            stage: self.stage,
+            session_id: self.session_id,
+            requests: self.requests,
+            bytes_read: self.wire.bytes_read.load(Ordering::Relaxed),
+            bytes_written: self.wire.bytes_written.load(Ordering::Relaxed),
+            highest_risk: format!("{:?}", self.highest_risk).to_lowercase(),
+        }
+    }
+}
+
+struct MeteredIo<S> {
+    inner: S,
+    counters: Arc<WireCounters>,
+}
+
+impl<S> MeteredIo<S> {
+    fn new(inner: S, counters: Arc<WireCounters>) -> Self {
+        Self { inner, counters }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for MeteredIo<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buffer.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buffer);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            let read = buffer.filled().len().saturating_sub(before);
+            self.counters
+                .bytes_read
+                .fetch_add(read as u64, Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for MeteredIo<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buffer);
+        if let Poll::Ready(Ok(written)) = result {
+            self.counters
+                .bytes_written
+                .fetch_add(written as u64, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
 pub async fn handle(
     shared: Arc<Shared>,
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
     connection_id: Uuid,
+) -> std::result::Result<Summary, Failure> {
+    let wire = Arc::new(WireCounters::default());
+    let mut progress = Progress::new(Arc::clone(&wire));
+    if let Err(error) = stream.set_nodelay(true) {
+        return Err(progress.failure(error.into()));
+    }
+    let stream = MeteredIo::new(stream, wire);
+    handle_inner(shared, stream, peer, connection_id, &mut progress)
+        .await
+        .map_err(|error| progress.failure(error))
+}
+
+async fn handle_inner(
+    shared: Arc<Shared>,
+    mut stream: MeteredIo<TcpStream>,
+    peer: SocketAddr,
+    connection_id: Uuid,
+    progress: &mut Progress,
 ) -> Result<Summary> {
-    stream.set_nodelay(true)?;
-    let mut counters = Counters::default();
+    progress.stage = "prelogin_read";
     let prelogin_message = timeout(
         shared.config.listener.login_timeout(),
         read_message(
@@ -72,7 +192,7 @@ pub async fn handle(
     )
     .await
     .map_err(|_| Error::Protocol("PRELOGIN timeout".into()))??;
-    counters.bytes_read += wire_size(&prelogin_message);
+    progress.stage = "prelogin_parse";
     if prelogin_message.packet_type != tds::PRELOGIN {
         return Err(Error::Protocol("first message was not PRELOGIN".into()));
     }
@@ -99,20 +219,16 @@ pub async fn handle(
         response_encryption,
         &shared.config.personality.instance_name,
     );
-    counters.bytes_written +=
-        write_message(&mut stream, tds::TABULAR_RESULT, &response, 4096).await?;
+    progress.stage = "prelogin_response";
+    write_message(&mut stream, tds::TABULAR_RESULT, &response, 4096).await?;
 
     if shared.config.tls.mode == TlsMode::Required
         && requested_encryption == Encryption::NotSupported
     {
-        return Ok(summary(
-            "client_does_not_support_required_tls",
-            None,
-            0,
-            counters,
-        ));
+        return Ok(progress.summary("client_does_not_support_required_tls"));
     }
     if use_tls {
+        progress.stage = "tls_handshake";
         let acceptor = shared
             .tls
             .as_ref()
@@ -137,9 +253,9 @@ pub async fn handle(
                         .map(|s| format!("{:?}", s.suite())),
                 ),
         );
-        login_and_serve(shared, tls, peer, connection_id, counters).await
+        login_and_serve(shared, tls, peer, connection_id, progress).await
     } else {
-        login_and_serve(shared, stream, peer, connection_id, counters).await
+        login_and_serve(shared, stream, peer, connection_id, progress).await
     }
 }
 
@@ -164,11 +280,12 @@ async fn login_and_serve<S>(
     mut stream: S,
     peer: SocketAddr,
     connection_id: Uuid,
-    mut counters: Counters,
+    progress: &mut Progress,
 ) -> Result<Summary>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    progress.stage = "login_read";
     let login_message = timeout(
         shared.config.listener.login_timeout(),
         read_message(
@@ -179,16 +296,18 @@ where
     )
     .await
     .map_err(|_| Error::Protocol("LOGIN7 timeout".into()))??;
-    counters.bytes_read += wire_size(&login_message);
+    progress.stage = "login_parse";
     if login_message.packet_type != tds::LOGIN7 {
         return Err(Error::Protocol("expected LOGIN7 message".into()));
     }
     let mut login = tds::login7::parse(&login_message.payload)?;
     let session_id = shared.sessions.fetch_add(1, Ordering::Relaxed);
+    progress.session_id = Some(session_id);
     shared
         .metrics
         .login_attempts
         .fetch_add(1, Ordering::Relaxed);
+    progress.stage = "authentication";
     let decision = if login.integrated_security {
         AuthDecision::Reject
     } else {
@@ -215,13 +334,13 @@ where
             ),
     );
     if !accepted {
+        progress.stage = "login_response";
         let response = tokens::login_failure(
             &shared.config.personality.server_name,
             decision == AuthDecision::Locked,
         )?;
-        counters.bytes_written +=
-            write_message(&mut stream, tds::TABULAR_RESULT, &response, 4096).await?;
-        return Ok(summary("login_rejected", Some(session_id), 0, counters));
+        write_message(&mut stream, tds::TABULAR_RESULT, &response, 4096).await?;
+        return Ok(progress.summary("login_rejected"));
     }
     shared
         .metrics
@@ -248,8 +367,8 @@ where
         packet_size as u32,
         "Microsoft SQL Server",
     )?;
-    counters.bytes_written +=
-        write_message(&mut stream, tds::TABULAR_RESULT, &response, packet_size).await?;
+    progress.stage = "login_response";
+    write_message(&mut stream, tds::TABULAR_RESULT, &response, packet_size).await?;
     let mut session = SessionState::new(
         connection_id,
         session_id,
@@ -261,13 +380,11 @@ where
 
     loop {
         if session.request_count >= shared.config.limits.max_requests_per_session {
-            return Ok(summary(
-                "request_limit",
-                Some(session_id),
-                session.request_count,
-                counters,
-            ));
+            progress.requests = session.request_count;
+            return Ok(progress.summary("request_limit"));
         }
+        progress.stage = "request_read";
+        progress.requests = session.request_count;
         let idle_deadline = TokioInstant::now() + shared.config.listener.idle_timeout();
         let message = match timeout_at(
             deadline.min(idle_deadline),
@@ -281,53 +398,29 @@ where
         {
             Ok(Ok(message)) => message,
             Ok(Err(Error::Io(error))) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(summary(
-                    "client_closed",
-                    Some(session_id),
-                    session.request_count,
-                    counters,
-                ));
+                return Ok(progress.summary("client_closed"));
             }
-            Ok(Err(error)) => {
-                shared
-                    .metrics
-                    .malformed_messages
-                    .fetch_add(1, Ordering::Relaxed);
-                return Err(error);
-            }
+            Ok(Err(error)) => return Err(error),
             Err(_) if TokioInstant::now() >= deadline => {
-                return Ok(summary(
-                    "session_timeout",
-                    Some(session_id),
-                    session.request_count,
-                    counters,
-                ));
+                return Ok(progress.summary("session_timeout"));
             }
             Err(_) => {
-                return Ok(summary(
-                    "idle_timeout",
-                    Some(session_id),
-                    session.request_count,
-                    counters,
-                ));
+                return Ok(progress.summary("idle_timeout"));
             }
         };
-        counters.bytes_read += wire_size(&message);
+        progress.stage = "request_parse";
         if !shared.allow_request(peer.ip()) {
             shared.telemetry.emit(
                 Event::new("rate_limit", Some(connection_id), Some(session_id))
                     .field("source_ip", peer.ip().to_string()),
             );
-            return Ok(summary(
-                "rate_limit",
-                Some(session_id),
-                session.request_count,
-                counters,
-            ));
+            return Ok(progress.summary("rate_limit"));
         }
         session.request_count += 1;
+        progress.requests = session.request_count;
         let (outcome, done_proc) = match message.packet_type {
             tds::SQL_BATCH => {
+                progress.stage = "sql_batch_parse";
                 shared.metrics.sql_batches.fetch_add(1, Ordering::Relaxed);
                 let sql =
                     tds::batch::decode(&message.payload, shared.config.limits.max_sql_batch_bytes)?;
@@ -343,6 +436,7 @@ where
                 (outcome, false)
             }
             tds::RPC => {
+                progress.stage = "rpc_parse";
                 shared.metrics.rpc_requests.fetch_add(1, Ordering::Relaxed);
                 let rpc = tds::rpc::parse(
                     &message.payload,
@@ -398,7 +492,7 @@ where
                 )));
             }
         };
-        update_risk(&mut counters, outcome.classification);
+        update_risk(progress, outcome.classification);
         shared.record_classification(outcome.classification);
         process_outcome(&shared, &session, &outcome).await;
         let response = tokens::response(
@@ -408,8 +502,8 @@ where
             &shared.config.personality.server_name,
             done_proc,
         )?;
-        counters.bytes_written +=
-            write_message(&mut stream, tds::TABULAR_RESULT, &response, packet_size).await?;
+        progress.stage = "response_write";
+        write_message(&mut stream, tds::TABULAR_RESULT, &response, packet_size).await?;
     }
 }
 
@@ -502,9 +596,9 @@ async fn process_outcome(shared: &Shared, session: &SessionState, outcome: &Outc
     }
 }
 
-fn update_risk(counters: &mut Counters, classification: Classification) {
-    if risk_rank(classification) > risk_rank(counters.highest_risk) {
-        counters.highest_risk = classification;
+fn update_risk(progress: &mut Progress, classification: Classification) {
+    if risk_rank(classification) > risk_rank(progress.highest_risk) {
+        progress.highest_risk = classification;
     }
 }
 fn risk_rank(c: Classification) -> u8 {
@@ -527,23 +621,9 @@ fn risk_rank(c: Classification) -> u8 {
         _ => 0,
     }
 }
-fn wire_size(message: &tds::packet::Message) -> u64 {
-    message.payload.len() as u64 + u64::from(message.packet_count) * 8
-}
 fn hex_version(v: [u8; 6]) -> String {
     format!(
         "{:02x}.{:02x}.{:02x}.{:02x}-{:02x}{:02x}",
         v[0], v[1], v[2], v[3], v[4], v[5]
     )
-}
-fn summary(reason: &str, session_id: Option<u32>, requests: u64, counters: Counters) -> Summary {
-    Summary {
-        reason: reason.into(),
-        session_id,
-        requests,
-        bytes_read: counters.bytes_read,
-        bytes_written: counters.bytes_written,
-        parser_errors: counters.parser_errors,
-        highest_risk: format!("{:?}", counters.highest_risk).to_lowercase(),
-    }
 }

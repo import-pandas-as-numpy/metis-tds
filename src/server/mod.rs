@@ -192,39 +192,75 @@ async fn connection_task(
         .metrics
         .total_session_duration_ms
         .fetch_add(duration_ms, Ordering::Relaxed);
-    let (reason, session_id, requests, bytes_read, bytes_written, parser_errors, highest_risk) =
-        match outcome {
-            Ok(summary) => (
-                summary.reason,
-                summary.session_id,
-                summary.requests,
-                summary.bytes_read,
-                summary.bytes_written,
-                summary.parser_errors,
-                summary.highest_risk,
-            ),
-            Err(error) => {
-                let parser_error = matches!(error, Error::Protocol(_) | Error::Limit(_));
-                if parser_error {
-                    shared
-                        .metrics
-                        .malformed_messages
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                tracing::debug!(%connection_id, %error, "connection ended with error");
-                (
-                    error.to_string(),
-                    None,
-                    0,
-                    0,
-                    0,
-                    u64::from(parser_error),
-                    "none".into(),
-                )
+    let (
+        reason,
+        stage,
+        error_kind,
+        session_id,
+        requests,
+        bytes_read,
+        bytes_written,
+        parser_errors,
+        highest_risk,
+    ) = match outcome {
+        Ok(summary) => (
+            summary.reason,
+            summary.stage,
+            "none",
+            summary.session_id,
+            summary.requests,
+            summary.bytes_read,
+            summary.bytes_written,
+            summary.parser_errors,
+            summary.highest_risk,
+        ),
+        Err(failure) => {
+            let parser_error = matches!(failure.error, Error::Protocol(_) | Error::Limit(_));
+            if parser_error {
+                shared
+                    .metrics
+                    .malformed_messages
+                    .fetch_add(1, Ordering::Relaxed);
+                shared.telemetry.emit(
+                    Event::new(
+                        "malformed_tds_message",
+                        Some(connection_id),
+                        failure.session_id,
+                    )
+                    .field("source_ip", peer.ip().to_string())
+                    .field("source_port", peer.port())
+                    .field("protocol_stage", failure.stage)
+                    .field("error_kind", failure.error.kind())
+                    .field("error", failure.error.to_string())
+                    .field("bytes_read", failure.bytes_read)
+                    .field("bytes_written", failure.bytes_written),
+                );
             }
-        };
+            tracing::debug!(
+                %connection_id,
+                stage = failure.stage,
+                error = %failure.error,
+                "connection ended with error"
+            );
+            (
+                failure.error.to_string(),
+                failure.stage,
+                failure.error.kind(),
+                failure.session_id,
+                failure.requests,
+                failure.bytes_read,
+                failure.bytes_written,
+                u64::from(parser_error),
+                failure.highest_risk,
+            )
+        }
+    };
     shared.telemetry.emit(
         Event::new("connection_close", Some(connection_id), session_id)
+            .field("source_ip", peer.ip().to_string())
+            .field("source_port", peer.port())
+            .field("protocol_stage", stage)
+            .field("error_kind", error_kind)
             .field("duration_ms", duration_ms)
             .field("request_count", requests)
             .field("bytes_read", bytes_read)
