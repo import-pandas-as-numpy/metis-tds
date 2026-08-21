@@ -4,7 +4,9 @@ use crate::{Error, Result};
 
 const HEADER_LEN: usize = 8;
 const STATUS_EOM: u8 = 0x01;
-const VALID_CLIENT_STATUS: u8 = 0x39;
+const STATUS_IGNORE: u8 = 0x02;
+const STATUS_RESET_CONNECTION: u8 = 0x08;
+const STATUS_RESET_CONNECTION_SKIP_TRAN: u8 = 0x10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
@@ -21,13 +23,23 @@ impl Header {
         let length = u16::from_be_bytes([raw[2], raw[3]]);
         if usize::from(length) < HEADER_LEN || usize::from(length) > max_packet {
             return Err(Error::Protocol(format!(
-                "invalid TDS packet length {length}"
+                "invalid TDS packet length {length} (type=0x{:02x}, status=0x{:02x}, packet_id={})",
+                raw[0], raw[1], raw[6]
             )));
         }
-        if raw[1] & !VALID_CLIENT_STATUS != 0 {
+        // MS-TDS requires receivers to ignore undefined status bits. Validate
+        // only combinations that the specification explicitly forbids.
+        if raw[1] & STATUS_IGNORE != 0 && raw[1] & STATUS_EOM == 0 {
             return Err(Error::Protocol(format!(
-                "invalid TDS status flags 0x{:02x}",
-                raw[1]
+                "TDS IGNORE status requires EOM (type=0x{:02x}, status=0x{:02x}, packet_id={})",
+                raw[0], raw[1], raw[6]
+            )));
+        }
+        if raw[1] & STATUS_RESET_CONNECTION != 0 && raw[1] & STATUS_RESET_CONNECTION_SKIP_TRAN != 0
+        {
+            return Err(Error::Protocol(format!(
+                "mutually exclusive TDS reset flags (type=0x{:02x}, status=0x{:02x}, packet_id={})",
+                raw[0], raw[1], raw[6]
             )));
         }
         Ok(Self {
@@ -63,6 +75,8 @@ impl Header {
 #[derive(Debug)]
 pub struct Message {
     pub packet_type: u8,
+    pub first_status: u8,
+    pub first_packet_id: u8,
     pub payload: Vec<u8>,
     pub packet_count: u32,
 }
@@ -74,21 +88,15 @@ pub async fn read_message<R: AsyncRead + Unpin>(
 ) -> Result<Message> {
     let mut assembled = Vec::new();
     let mut expected_type = None;
-    let mut expected_packet_id = None;
+    let mut first_header = None;
     let mut packet_count = 0_u32;
     loop {
         let mut raw = [0_u8; HEADER_LEN];
         reader.read_exact(&mut raw).await?;
         let header = Header::decode(raw, max_packet)?;
-        if let Some(expected) = expected_packet_id
-            && header.packet_id != expected
-        {
-            return Err(Error::Protocol(format!(
-                "unexpected TDS packet id {}, expected {expected}",
-                header.packet_id
-            )));
-        }
-        expected_packet_id = Some(header.packet_id.wrapping_add(1));
+        // PacketID is advisory and explicitly ignored by receivers in MS-TDS.
+        // Real clients normally increment it, but interoperability must not
+        // depend on that behavior.
         if let Some(packet_type) = expected_type {
             if packet_type != header.packet_type {
                 return Err(Error::Protocol(
@@ -97,6 +105,7 @@ pub async fn read_message<R: AsyncRead + Unpin>(
             }
         } else {
             expected_type = Some(header.packet_type);
+            first_header = Some(header);
         }
         let body_len = usize::from(header.length) - HEADER_LEN;
         if assembled
@@ -113,8 +122,11 @@ pub async fn read_message<R: AsyncRead + Unpin>(
             .checked_add(1)
             .ok_or(Error::Limit("TDS packet count"))?;
         if header.is_eom() {
+            let first = first_header.expect("message contains at least one packet");
             return Ok(Message {
                 packet_type: header.packet_type,
+                first_status: first.status,
+                first_packet_id: first.packet_id,
                 payload: assembled,
                 packet_count,
             });
@@ -172,7 +184,14 @@ mod tests {
     fn rejects_short_and_oversized_headers() {
         assert!(Header::decode([1, 1, 0, 7, 0, 0, 1, 0], 4096).is_err());
         assert!(Header::decode([1, 1, 0x20, 0, 0, 0, 1, 0], 4096).is_err());
-        assert!(Header::decode([1, 0x80, 0, 8, 0, 0, 1, 0], 4096).is_err());
+    }
+
+    #[test]
+    fn accepts_ignore_and_unknown_status_bits_but_rejects_invalid_combinations() {
+        assert!(Header::decode([1, 0x03, 0, 8, 0, 0, 1, 0], 4096).is_ok());
+        assert!(Header::decode([1, 0x41, 0, 8, 0, 0, 1, 0], 4096).is_ok());
+        assert!(Header::decode([1, 0x02, 0, 8, 0, 0, 1, 0], 4096).is_err());
+        assert!(Header::decode([1, 0x19, 0, 8, 0, 0, 1, 0], 4096).is_err());
     }
 
     #[tokio::test]
@@ -185,5 +204,17 @@ mod tests {
         let message = read_message(&mut input, 12, 100).await.unwrap();
         assert_eq!(message.payload, b"abcdefghij");
         assert_eq!(message.packet_count, 3);
+    }
+
+    #[tokio::test]
+    async fn packet_ids_do_not_affect_reassembly() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&[1, 0, 0, 9, 0, 0, 42, 0, b'a']);
+        input.extend_from_slice(&[1, 1, 0, 9, 0, 0, 7, 0, b'b']);
+        let message = read_message(&mut input.as_slice(), 4096, 100)
+            .await
+            .unwrap();
+        assert_eq!(message.payload, b"ab");
+        assert_eq!(message.first_packet_id, 42);
     }
 }

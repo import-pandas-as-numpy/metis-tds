@@ -2,14 +2,14 @@
 
 This is the restart-safe source of truth for the project. Update it whenever a feature is implemented, verified, deferred, or found incompatible. A checked box means code and an automated check exist; client compatibility is only claimed when the named client has been exercised.
 
-Last updated: 2026-08-17
+Last updated: 2026-08-20
 
 ## Current phase
 
 - [x] Specification read and decomposed.
 - [x] Rust project scaffolded from an empty workspace.
 - [x] Direct dependency versions reviewed with Socket MCP.
-- [x] Wire-level implementation complete for the documented TDS 7.4 scope.
+- [x] Wire-level implementation complete for TDS 7.4 and the TDS 8.0 strict-encryption entry path.
 - [x] Behavioral implementation complete for the initial attacker workflow corpus.
 - [ ] External client/scanner matrix complete.
 - [x] Coverage-guided fuzz targets implemented for the required parser/encoder surfaces.
@@ -24,9 +24,10 @@ The user explicitly approved cargo-fuzz on 2026-08-17. Socket MCP scored `cargo-
 
 ### Protocol
 
-- [x] Bounded TDS packet framing, packet-ID validation, and multi-packet reassembly
+- [x] Bounded TDS packet framing and multi-packet reassembly; PacketID is recorded but ignored as required by MS-TDS
 - [x] PRELOGIN parse/response (VERSION, ENCRYPTION, INSTOPT, THREADID, MARS)
 - [x] TDS-encapsulated TLS handshake and encrypted session (TLS 1.3 independently verified; rustls TLS 1.2 enabled)
+- [x] TDS 8.0 raw TLS-before-PRELOGIN with `tds/8.0` ALPN and encrypted LOGIN7
 - [x] LOGIN7 safe field extraction, transient password discard, and SQL-auth decisions
 - [x] LOGINACK / ENVCHANGE / INFO / ERROR / DONE encoding
 - [x] SQL_BATCH UTF-16 decoding and result sets
@@ -43,6 +44,7 @@ The user explicitly approved cargo-fuzz on 2026-08-17. Socket MCP scored `cargo-
 - [x] Bounded SHA-256 payload capture using generated mode-0600 non-executable files
 - [x] Bounded asynchronous JSONL/stdout telemetry with dropped-event count
 - [x] Connection/PRELOGIN/TLS/login/request/state/honey/payload/close/metrics events
+- [x] Stage-local failure byte counts, safe TDS header metadata, and bounded pre-LOGIN7 wire prefixes
 
 ### Hardening
 
@@ -62,6 +64,7 @@ Blank means untested, not unsupported.
 |---|---:|---:|---:|---:|---:|---|
 | Built-in protocol test client | pass | not exercised | pass | pass | n/a | `tests/protocol_flow.rs` |
 | Tiberius 0.12.3 | pass | pass (required/TLS 1.3) | pass | pass | pass (`sp_executesql`) | `tests/tiberius_compat.rs`, `tests/tls_compat.rs` |
+| Built-in strict TDS 8.0 client | pass (inside raw TLS) | pass (TLS first, `tds/8.0` ALPN) | pass | not exercised | not exercised | `tests/tls_compat.rs` |
 | sqlcmd |  |  |  |  |  | |
 | FreeTDS (`tsql`) |  |  |  |  |  | |
 | Impacket `mssqlclient.py` |  |  |  |  |  | |
@@ -82,7 +85,7 @@ Blank means untested, not unsupported.
 
 ## Known limits / next evidence needed
 
-- TDS 7.4 SQL authentication is the compatibility target. Integrated SSPI/FedAuth, MARS, TDS 8.0, TVP/encrypted RPC parameters, and arbitrary T-SQL semantics are intentionally unsupported.
+- SQL authentication over TDS 7.4 and the TDS 8.0 strict-encryption entry path are compatibility targets. Integrated SSPI/FedAuth, MARS, TVP/encrypted RPC parameters, and arbitrary T-SQL semantics are intentionally unsupported; integrated LOGIN7 attempts are still identified and logged before rejection.
 - `sqlcmd`, FreeTDS, Impacket, and SSMS are not installed in this environment and remain unclaimed.
 - Shodan/Censys identification requires deploying the service on a public address and observing the external classifier; local PRELOGIN conformance is necessary but not proof of indexing.
 - Coverage-guided fuzzing is approved and scaffolded. See verification evidence for the most recent bounded campaign result.

@@ -3,6 +3,7 @@ mod tls;
 
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     net::IpAddr,
     sync::{
         Arc, Mutex,
@@ -216,6 +217,53 @@ async fn connection_task(
         ),
         Err(failure) => {
             let parser_error = matches!(failure.error, Error::Protocol(_) | Error::Limit(_));
+            let prefix_is_safe = matches!(
+                failure.stage,
+                "connection_setup"
+                    | "initial_probe"
+                    | "prelogin_read"
+                    | "prelogin_parse"
+                    | "prelogin_response"
+                    | "tls_handshake"
+                    | "tls8_handshake"
+                    | "prelogin8_read"
+                    | "prelogin8_parse"
+                    | "prelogin8_response"
+            );
+            let diagnostic_prefix = prefix_is_safe.then(|| hex(&failure.read_prefix));
+            shared.telemetry.emit(
+                Event::new(
+                    "connection_failure",
+                    Some(connection_id),
+                    failure.session_id,
+                )
+                .field("source_ip", peer.ip().to_string())
+                .field("source_port", peer.port())
+                .field("protocol_stage", failure.stage)
+                .field("error_kind", failure.error.kind())
+                .field("error", failure.error.to_string())
+                .field("bytes_read", failure.bytes_read)
+                .field("bytes_written", failure.bytes_written)
+                .field("stage_bytes_read", failure.stage_bytes_read)
+                .field("stage_bytes_written", failure.stage_bytes_written)
+                .field("last_packet_type", failure.last_packet_type)
+                .field("last_first_status", failure.last_first_status)
+                .field("last_first_packet_id", failure.last_first_packet_id)
+                .field("last_packet_count", failure.last_packet_count)
+                .field("last_message_bytes", failure.last_message_bytes)
+                .field("read_prefix_hex", diagnostic_prefix)
+                .field(
+                    "read_prefix_bytes",
+                    prefix_is_safe.then_some(failure.read_prefix.len()),
+                )
+                .field(
+                    "read_prefix_truncated",
+                    prefix_is_safe.then_some(
+                        failure.bytes_read
+                            > u64::try_from(failure.read_prefix.len()).unwrap_or(u64::MAX),
+                    ),
+                ),
+            );
             if parser_error {
                 shared
                     .metrics
@@ -233,7 +281,14 @@ async fn connection_task(
                     .field("error_kind", failure.error.kind())
                     .field("error", failure.error.to_string())
                     .field("bytes_read", failure.bytes_read)
-                    .field("bytes_written", failure.bytes_written),
+                    .field("bytes_written", failure.bytes_written)
+                    .field("stage_bytes_read", failure.stage_bytes_read)
+                    .field("stage_bytes_written", failure.stage_bytes_written)
+                    .field("last_packet_type", failure.last_packet_type)
+                    .field("last_first_status", failure.last_first_status)
+                    .field("last_first_packet_id", failure.last_first_packet_id)
+                    .field("last_packet_count", failure.last_packet_count)
+                    .field("last_message_bytes", failure.last_message_bytes),
                 );
             }
             tracing::debug!(
@@ -336,6 +391,14 @@ async fn connection_task(
                     .unwrap_or(0),
             ),
     );
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
 }
 
 impl Shared {
