@@ -41,7 +41,7 @@
     "domain": "NORTHSTAR",
     "default_database": "ERP_Production",
     "language": "us_english",
-    "accept_unknown_logins": true,
+    "accept_unknown_logins": false,
     "unknown_query_behavior": "empty",
     "databases": [
       "master",
