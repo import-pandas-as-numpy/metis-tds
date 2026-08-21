@@ -32,13 +32,14 @@ pub async fn acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
         .ok_or_else(|| Error::Config("missing TLS private key DER".into()))?;
     let certificate = read_bounded(certificate_path, 1024 * 1024).await?;
     let key = read_bounded(key_path, 1024 * 1024).await?;
-    let server = ServerConfig::builder()
+    let mut server = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
             vec![CertificateDer::from(certificate)],
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
         )
         .map_err(|error| Error::Tls(error.to_string()))?;
+    server.alpn_protocols = vec![b"tds/8.0".to_vec()];
     Ok(TlsAcceptor::from(Arc::new(server)))
 }
 
@@ -58,8 +59,20 @@ where
         .accept(TdsTlsIo::new(stream))
         .await
         .map_err(|e| Error::Tls(e.to_string()))?;
-    tls.flush().await?;
     tls.get_mut().0.enable_raw_mode();
+    tls.flush().await?;
+    Ok(tls)
+}
+
+pub async fn handshake_raw<S>(stream: S, acceptor: &TlsAcceptor) -> Result<TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut tls = acceptor
+        .accept(stream)
+        .await
+        .map_err(|error| Error::Tls(error.to_string()))?;
+    tls.flush().await?;
     Ok(tls)
 }
 
@@ -69,8 +82,6 @@ pub struct TdsTlsIo<S> {
     inner: S,
     raw_read: bool,
     raw_write: bool,
-    handshake_messages_read: u8,
-    current_message_eom: bool,
     read_header: [u8; HEADER_LEN],
     read_header_pos: usize,
     read_payload: Vec<u8>,
@@ -87,8 +98,6 @@ impl<S> TdsTlsIo<S> {
             inner,
             raw_read: false,
             raw_write: false,
-            handshake_messages_read: 0,
-            current_message_eom: false,
             read_header: [0; HEADER_LEN],
             read_header_pos: 0,
             read_payload: Vec::new(),
@@ -152,20 +161,16 @@ impl<S: AsyncRead + Unpin> AsyncRead for TdsTlsIo<S> {
                 );
                 self.read_payload_pos += take;
                 if self.read_payload_pos == self.read_payload.len() {
+                    let handshake_complete = final_client_handshake_flight(&self.read_payload);
                     self.read_payload.clear();
                     self.read_payload_filled = 0;
                     self.read_payload_pos = 0;
-                    if self.current_message_eom {
-                        self.handshake_messages_read =
-                            self.handshake_messages_read.saturating_add(1);
-                        // A TDS 7.x TLS handshake has two client flights: the
-                        // ClientHello and the client's final handshake flight.
-                        // Clients switch to raw TLS records immediately after
-                        // the latter, before the server accept future returns.
-                        if self.handshake_messages_read >= 2 {
-                            self.raw_read = true;
-                            self.raw_write = true;
-                        }
+                    if handshake_complete {
+                        // The client switches to raw TLS records immediately
+                        // after its final handshake flight. Switch writes here
+                        // as well so post-handshake tickets are not TDS-wrapped.
+                        self.raw_read = true;
+                        self.raw_write = true;
                     }
                 }
                 return Poll::Ready(Ok(()));
@@ -200,7 +205,6 @@ impl<S: AsyncRead + Unpin> AsyncRead for TdsTlsIo<S> {
                         "invalid TDS-wrapped TLS packet",
                     )));
                 }
-                self.current_message_eom = self.read_header[1] & 1 != 0;
                 self.read_payload.resize(length - HEADER_LEN, 0);
                 self.read_payload_filled = 0;
             }
@@ -227,6 +231,20 @@ impl<S: AsyncRead + Unpin> AsyncRead for TdsTlsIo<S> {
             self.read_header_pos = 0;
             self.read_payload_pos = 0;
         }
+    }
+}
+
+fn final_client_handshake_flight(payload: &[u8]) -> bool {
+    match payload.first().copied() {
+        // TLS 1.3 encrypts the client's Finished flight as application data.
+        Some(0x17) => true,
+        // TLS 1.2 final flights can begin with ChangeCipherSpec.
+        Some(0x14) => true,
+        // A plaintext handshake record whose first handshake message is not
+        // ClientHello is a TLS 1.2 final flight. ClientHello remains wrapped,
+        // including a second ClientHello after HelloRetryRequest.
+        Some(0x16) if payload.len() > 5 => payload[5] != 0x01,
+        _ => false,
     }
 }
 
@@ -295,5 +313,18 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TdsTlsIo<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::final_client_handshake_flight;
+
+    #[test]
+    fn distinguishes_client_hello_retries_from_final_tls_flights() {
+        assert!(!final_client_handshake_flight(&[0x16, 3, 3, 0, 1, 0x01]));
+        assert!(final_client_handshake_flight(&[0x16, 3, 3, 0, 1, 0x10]));
+        assert!(final_client_handshake_flight(&[0x17, 3, 3, 0, 1, 0]));
+        assert!(final_client_handshake_flight(&[0x14, 3, 3, 0, 1, 1]));
     }
 }

@@ -780,6 +780,12 @@ Capture:
 
 Do not include raw LOGIN7 bytes or password material in parser-error telemetry.
 
+Every failed connection also emits `connection_failure` with stage-local byte
+counts and the last successfully framed message metadata. Failures before a
+LOGIN7 could contain credentials may include at most the first 256 received
+wire bytes as hexadecimal for protocol identification. LOGIN7 and later stages
+must never include a raw wire prefix.
+
 ### 15.8 Connection Close
 
 Capture:

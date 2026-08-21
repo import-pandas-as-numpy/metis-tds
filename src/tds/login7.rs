@@ -75,10 +75,21 @@ fn raw_field(payload: &[u8], descriptor_offset: usize, declared: usize) -> Resul
     let bytes = chars
         .checked_mul(2)
         .ok_or_else(|| Error::Protocol("LOGIN7 field length overflow".into()))?;
+    // MS-TDS explicitly says the offset must be ignored when a variable field
+    // has zero length. The hostname descriptor is the sole exception because
+    // it identifies the beginning of the variable-length portion.
+    if bytes == 0 {
+        if descriptor_offset == 36 && !(FIXED_LENGTH..=declared).contains(&offset) {
+            return Err(Error::Protocol(
+                "LOGIN7 hostname offset does not identify variable data".into(),
+            ));
+        }
+        return Ok(&[]);
+    }
     let end = offset
         .checked_add(bytes)
         .ok_or_else(|| Error::Protocol("LOGIN7 field offset overflow".into()))?;
-    if end > declared || (bytes != 0 && offset < FIXED_LENGTH) {
+    if end > declared || offset < FIXED_LENGTH {
         return Err(Error::Protocol("LOGIN7 field is outside message".into()));
     }
     Ok(&payload[offset..end])
@@ -144,5 +155,18 @@ mod tests {
         let original: Vec<u8> = "Secret".encode_utf16().flat_map(u16::to_le_bytes).collect();
         let encoded: Vec<u8> = original.iter().map(|b| b.rotate_right(4) ^ 0xa5).collect();
         assert_eq!(deobfuscate_password(&encoded).unwrap(), "Secret");
+    }
+
+    #[test]
+    fn ignores_offsets_for_empty_variable_fields() {
+        let mut payload = vec![0_u8; FIXED_LENGTH];
+        payload[0..4].copy_from_slice(&(FIXED_LENGTH as u32).to_le_bytes());
+        payload[36..38].copy_from_slice(&(FIXED_LENGTH as u16).to_le_bytes());
+        for descriptor in [40, 44, 48, 52, 60, 64, 68] {
+            payload[descriptor..descriptor + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        }
+        let login = parse(&payload).unwrap();
+        assert!(login.username.is_empty());
+        assert!(!login.password_present);
     }
 }

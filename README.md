@@ -1,10 +1,10 @@
 # Metis TDS honeypot
 
-Metis is a contained Microsoft SQL Server TDS 7.x honeypot. It accepts real TDS connections, records login and request telemetry, classifies attacker intent, and returns synthetic SQL Server responses. It never executes submitted SQL, commands, assemblies, paths, or network destinations.
+Metis is a contained Microsoft SQL Server TDS 7.x/8.0 honeypot. It accepts real TDS connections, records login and request telemetry, classifies attacker intent, and returns synthetic SQL Server responses. It never executes submitted SQL, commands, assemblies, paths, or network destinations.
 
 The detailed requirements are in `mssql-tds-honeypot-spec.md`; verified progress and compatibility evidence are in `IMPLEMENTATION_LOG.md`.
 
-Protocol behavior is implemented from Microsoft's current MS-TDS open specification. The project supports bounded multi-packet framing, TDS 7.4 PRELOGIN/LOGIN7, TDS-wrapped TLS 1.2/1.3, SQL batches, common RPC parameters, stateful attacker-oriented semantics, synthetic result sets, JSONL telemetry, and bounded payload capture.
+Protocol behavior is implemented from Microsoft's current MS-TDS open specification. The project supports bounded multi-packet framing, TDS 7.4 PRELOGIN/LOGIN7, TDS 7.x-wrapped TLS 1.2/1.3, TDS 8.0 TLS-before-PRELOGIN with `tds/8.0` ALPN, SQL batches, common RPC parameters, stateful attacker-oriented semantics, synthetic result sets, JSONL telemetry, and bounded payload capture.
 
 ## Safety boundary
 
@@ -49,7 +49,7 @@ cargo deny check
 cargo deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check
 ```
 
-The test suite includes a standalone protocol client plus independent Tiberius client flows for plaintext SQL batch/RPC and required TLS. `sqlcmd`, SSMS, FreeTDS, Impacket, Censys, and Shodan remain unclaimed until they have been exercised against a deployed instance; see the compatibility ledger.
+The test suite includes a standalone protocol client, independent Tiberius client flows for plaintext SQL batch/RPC and required TDS 7.x TLS, and a strict TDS 8.0 raw-TLS/PRELOGIN/LOGIN7 flow. `sqlcmd`, SSMS, FreeTDS, Impacket, Censys, and Shodan remain unclaimed until they have been exercised against a deployed instance; see the compatibility ledger.
 
 Coverage-guided fuzz targets are isolated from the production dependency graph under `fuzz/`. They require nightly Rust and `cargo-fuzz 0.13.2`:
 

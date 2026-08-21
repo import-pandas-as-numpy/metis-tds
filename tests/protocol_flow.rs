@@ -119,26 +119,9 @@ async fn malformed_packet_reports_source_stage_error_and_wire_bytes() {
     let task = tokio::spawn(Server::new(config).await.unwrap().serve(listener, false));
 
     let mut client = TcpStream::connect(address).await.unwrap();
-    let malformed = [
-        tds::PRELOGIN,
-        0,
-        0,
-        9,
-        0,
-        0,
-        0,
-        0,
-        0,
-        tds::PRELOGIN,
-        1,
-        0,
-        9,
-        0,
-        0,
-        0,
-        0,
-        0,
-    ];
+    // IGNORE without EOM is the one status combination MS-TDS explicitly
+    // rejects. Undefined bits, by contrast, must be ignored by receivers.
+    let malformed = [tds::PRELOGIN, 0x02, 0, 8, 0, 0, 0, 0];
     client.write_all(&malformed).await.unwrap();
     drop(client);
 
@@ -165,13 +148,23 @@ async fn malformed_packet_reports_source_stage_error_and_wire_bytes() {
     assert_eq!(malformed_event["source_ip"], "127.0.0.1");
     assert_eq!(malformed_event["protocol_stage"], "prelogin_read");
     assert_eq!(malformed_event["error_kind"], "protocol");
-    assert_eq!(malformed_event["bytes_read"], malformed.len() - 1);
+    assert_eq!(malformed_event["bytes_read"], malformed.len());
     assert!(
         malformed_event["error"]
             .as_str()
             .unwrap()
-            .contains("unexpected TDS packet id")
+            .contains("IGNORE status requires EOM")
     );
+
+    let diagnostic = events
+        .iter()
+        .find(|event| event["event_type"] == "connection_failure")
+        .expect("connection failure diagnostic");
+    assert_eq!(diagnostic["stage_bytes_read"], malformed.len());
+    assert_eq!(diagnostic["stage_bytes_written"], 0);
+    assert_eq!(diagnostic["read_prefix_bytes"], malformed.len());
+    assert_eq!(diagnostic["read_prefix_hex"], "1202000800000000");
+    assert_eq!(diagnostic["read_prefix_truncated"], false);
 
     let close = events
         .iter()
@@ -181,7 +174,7 @@ async fn malformed_packet_reports_source_stage_error_and_wire_bytes() {
     assert_eq!(close["protocol_stage"], "prelogin_read");
     assert_eq!(close["error_kind"], "protocol");
     assert_eq!(close["parser_errors"], 1);
-    assert_eq!(close["bytes_read"], malformed.len() - 1);
+    assert_eq!(close["bytes_read"], malformed.len());
     task.abort();
 }
 
