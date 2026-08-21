@@ -20,9 +20,15 @@ pub struct LoginRequest {
     pub language: String,
     pub database: String,
     pub integrated_security: bool,
+    pub sspi_bytes: usize,
+    pub sspi_token_family: Option<&'static str>,
 }
 
 impl LoginRequest {
+    pub(crate) fn password_for_capture(&self) -> Option<&str> {
+        self.password.as_deref()
+    }
+
     pub(crate) fn discard_password(&mut self) {
         self.password = None;
     }
@@ -46,6 +52,7 @@ pub fn parse(payload: &[u8]) -> Result<LoginRequest> {
     } else {
         None
     };
+    let sspi = sspi_field(payload, declared)?;
     Ok(LoginRequest {
         tds_version: le_u32(payload, 4)?,
         packet_size: le_u32(payload, 8)?,
@@ -63,6 +70,8 @@ pub fn parse(payload: &[u8]) -> Result<LoginRequest> {
         language: field(payload, 64, declared, false)?,
         database: field(payload, 68, declared, false)?,
         integrated_security: option_flags_2 & 0x80 != 0,
+        sspi_bytes: sspi.len(),
+        sspi_token_family: classify_sspi(sspi),
     })
 }
 
@@ -75,15 +84,9 @@ fn raw_field(payload: &[u8], descriptor_offset: usize, declared: usize) -> Resul
     let bytes = chars
         .checked_mul(2)
         .ok_or_else(|| Error::Protocol("LOGIN7 field length overflow".into()))?;
-    // MS-TDS explicitly says the offset must be ignored when a variable field
-    // has zero length. The hostname descriptor is the sole exception because
-    // it identifies the beginning of the variable-length portion.
+    // Empty fields carry no data, so their offsets cannot safely be validated.
+    // Real clients, including legacy direct-LOGIN7 clients, use zero here.
     if bytes == 0 {
-        if descriptor_offset == 36 && !(FIXED_LENGTH..=declared).contains(&offset) {
-            return Err(Error::Protocol(
-                "LOGIN7 hostname offset does not identify variable data".into(),
-            ));
-        }
         return Ok(&[]);
     }
     let end = offset
@@ -93,6 +96,44 @@ fn raw_field(payload: &[u8], descriptor_offset: usize, declared: usize) -> Resul
         return Err(Error::Protocol("LOGIN7 field is outside message".into()));
     }
     Ok(&payload[offset..end])
+}
+
+fn sspi_field(payload: &[u8], declared: usize) -> Result<&[u8]> {
+    let descriptor = payload
+        .get(78..82)
+        .ok_or_else(|| Error::Protocol("LOGIN7 SSPI descriptor truncated".into()))?;
+    let offset = usize::from(u16::from_le_bytes([descriptor[0], descriptor[1]]));
+    let short_length = u16::from_le_bytes([descriptor[2], descriptor[3]]);
+    let length = if short_length == u16::MAX {
+        usize::try_from(le_u32(payload, 90)?)
+            .map_err(|_| Error::Protocol("LOGIN7 SSPI length overflow".into()))?
+    } else {
+        usize::from(short_length)
+    };
+    if length == 0 {
+        return Ok(&[]);
+    }
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| Error::Protocol("LOGIN7 SSPI offset overflow".into()))?;
+    if offset < FIXED_LENGTH || end > declared {
+        return Err(Error::Protocol(
+            "LOGIN7 SSPI field is outside message".into(),
+        ));
+    }
+    Ok(&payload[offset..end])
+}
+
+fn classify_sspi(token: &[u8]) -> Option<&'static str> {
+    if token.is_empty() {
+        None
+    } else if token.starts_with(b"NTLMSSP\0") {
+        Some("ntlmssp")
+    } else if token.first() == Some(&0x60) {
+        Some("spnego")
+    } else {
+        Some("other")
+    }
 }
 
 fn field(
@@ -161,12 +202,27 @@ mod tests {
     fn ignores_offsets_for_empty_variable_fields() {
         let mut payload = vec![0_u8; FIXED_LENGTH];
         payload[0..4].copy_from_slice(&(FIXED_LENGTH as u32).to_le_bytes());
-        payload[36..38].copy_from_slice(&(FIXED_LENGTH as u16).to_le_bytes());
-        for descriptor in [40, 44, 48, 52, 60, 64, 68] {
+        for descriptor in [36, 40, 44, 48, 52, 60, 64, 68, 78] {
             payload[descriptor..descriptor + 2].copy_from_slice(&u16::MAX.to_le_bytes());
         }
         let login = parse(&payload).unwrap();
         assert!(login.username.is_empty());
         assert!(!login.password_present);
+    }
+
+    #[test]
+    fn identifies_sspi_without_retaining_the_token() {
+        let token = b"NTLMSSP\0\x01\0\0\0";
+        let mut payload = vec![0_u8; FIXED_LENGTH];
+        payload[0..4].copy_from_slice(&((FIXED_LENGTH + token.len()) as u32).to_le_bytes());
+        payload[25] = 0x80;
+        payload[78..80].copy_from_slice(&(FIXED_LENGTH as u16).to_le_bytes());
+        payload[80..82].copy_from_slice(&(token.len() as u16).to_le_bytes());
+        payload.extend_from_slice(token);
+
+        let login = parse(&payload).unwrap();
+        assert!(login.integrated_security);
+        assert_eq!(login.sspi_bytes, token.len());
+        assert_eq!(login.sspi_token_family, Some("ntlmssp"));
     }
 }

@@ -55,6 +55,19 @@ impl Config {
                 "personality.databases may not be empty".into(),
             ));
         }
+        if self.telemetry.capture_login_passwords
+            && (self.telemetry.stdout || self.telemetry.jsonl_path.is_none())
+        {
+            return Err(Error::Config(
+                "telemetry.capture_login_passwords requires a JSONL path and telemetry.stdout=false"
+                    .into(),
+            ));
+        }
+        if self.payloads.capture_login7 && !self.payloads.enabled {
+            return Err(Error::Config(
+                "payloads.capture_login7 requires payloads.enabled=true".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -155,6 +168,7 @@ impl Default for Limits {
 pub struct TelemetryConfig {
     pub jsonl_path: Option<String>,
     pub stdout: bool,
+    pub capture_login_passwords: bool,
 }
 
 impl Default for TelemetryConfig {
@@ -162,6 +176,7 @@ impl Default for TelemetryConfig {
         Self {
             jsonl_path: Some("events.jsonl".into()),
             stdout: true,
+            capture_login_passwords: false,
         }
     }
 }
@@ -171,6 +186,7 @@ impl Default for TelemetryConfig {
 pub struct PayloadConfig {
     pub enabled: bool,
     pub directory: String,
+    pub capture_login7: bool,
 }
 
 impl Default for PayloadConfig {
@@ -178,6 +194,7 @@ impl Default for PayloadConfig {
         Self {
             enabled: false,
             directory: "payloads".into(),
+            capture_login7: false,
         }
     }
 }

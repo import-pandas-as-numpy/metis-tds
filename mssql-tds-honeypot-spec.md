@@ -284,8 +284,13 @@ Passwords must never be logged in plaintext by default.
 If authentication capture is enabled for research use, credentials must be:
 
 - explicitly opted in,
-- encrypted at rest or immediately one-way hashed,
-- excluded from ordinary logs.
+- written only to a restricted mode-`0600` JSONL sink with stdout disabled,
+- excluded from ordinary parser-error and container-runtime logs.
+
+Complete LOGIN7 messages may also be retained as bounded, generated mode-`0600`
+artifacts. The corresponding ordinary event contains only the artifact identifier,
+size, and SHA-256 digest. Operators must treat both credential telemetry and
+LOGIN7 artifacts as sensitive evidence and apply access control and retention.
 
 ### 7.6 Authentication Behavior
 
@@ -1132,10 +1137,13 @@ limits:
 
 telemetry:
   jsonl_path: "/var/log/tdshoney/events.jsonl"
+  stdout: false
+  capture_login_passwords: true
 
 payloads:
   enabled: true
   directory: "/var/lib/tdshoney/payloads"
+  capture_login7: true
 ```
 
 ---

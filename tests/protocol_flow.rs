@@ -178,6 +178,150 @@ async fn malformed_packet_reports_source_stage_error_and_wire_bytes() {
     task.abort();
 }
 
+#[tokio::test]
+async fn direct_sql_login_captures_credentials_and_restricted_login7_artifact() {
+    let temp = tempfile::tempdir().unwrap();
+    let telemetry_path = temp.path().join("events.jsonl");
+    let payload_directory = temp.path().join("payloads");
+    let mut config = Config::default();
+    config.listener.address = "127.0.0.1:0".into();
+    config.telemetry.jsonl_path = Some(telemetry_path.to_string_lossy().into_owned());
+    config.telemetry.stdout = false;
+    config.telemetry.capture_login_passwords = true;
+    config.payloads.enabled = true;
+    config.payloads.capture_login7 = true;
+    config.payloads.directory = payload_directory.to_string_lossy().into_owned();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(Server::new(config).await.unwrap().serve(listener, false));
+
+    let payload = login7("direct_probe", "Password123!", "legacy-client", "master");
+    let mut client = TcpStream::connect(address).await.unwrap();
+    write_message(&mut client, tds::LOGIN7, &payload, 4096)
+        .await
+        .unwrap();
+    let response = read_message(&mut client, 4096, 65_536).await.unwrap();
+    assert!(response.payload.contains(&0xad));
+    drop(client);
+
+    let events = wait_for_events(&telemetry_path, "login7_capture").await;
+    let login = events
+        .iter()
+        .find(|event| event["event_type"] == "login_attempt")
+        .expect("login attempt event");
+    assert_eq!(login["transport"], "tds7_direct");
+    assert_eq!(login["username"], "direct_probe");
+    assert_eq!(login["password"], "Password123!");
+    let capture = events
+        .iter()
+        .find(|event| event["event_type"] == "login7_capture")
+        .expect("LOGIN7 capture event");
+    let stored = payload_directory.join(format!("{}.bin", capture["storage_id"].as_str().unwrap()));
+    let metadata = std::fs::metadata(&stored).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+    assert_eq!(std::fs::read(stored).unwrap(), payload);
+    task.abort();
+}
+
+#[tokio::test]
+async fn direct_ntlm_login_is_classified_without_putting_token_in_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let telemetry_path = temp.path().join("events.jsonl");
+    let mut config = Config::default();
+    config.listener.address = "127.0.0.1:0".into();
+    config.telemetry.jsonl_path = Some(telemetry_path.to_string_lossy().into_owned());
+    config.telemetry.stdout = false;
+    config.payloads.enabled = false;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(Server::new(config).await.unwrap().serve(listener, false));
+
+    let token = b"NTLMSSP\0\x01\0\0\0synthetic-negotiate";
+    let payload = integrated_login7(token);
+    let mut client = TcpStream::connect(address).await.unwrap();
+    write_message(&mut client, tds::LOGIN7, &payload, 4096)
+        .await
+        .unwrap();
+    let response = read_message(&mut client, 4096, 65_536).await.unwrap();
+    assert_eq!(response.payload.first(), Some(&0xaa));
+    drop(client);
+
+    let events = wait_for_events(&telemetry_path, "connection_close").await;
+    let login = events
+        .iter()
+        .find(|event| event["event_type"] == "login_attempt")
+        .expect("login attempt event");
+    assert_eq!(login["transport"], "tds7_direct");
+    assert_eq!(login["integrated_security"], true);
+    assert_eq!(login["sspi_bytes"], token.len());
+    assert_eq!(login["sspi_token_family"], "ntlmssp");
+    assert!(
+        !std::fs::read_to_string(&telemetry_path)
+            .unwrap()
+            .contains("synthetic-negotiate")
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn malformed_direct_login_never_enters_generic_wire_diagnostics() {
+    let temp = tempfile::tempdir().unwrap();
+    let telemetry_path = temp.path().join("events.jsonl");
+    let mut config = Config::default();
+    config.listener.address = "127.0.0.1:0".into();
+    config.telemetry.jsonl_path = Some(telemetry_path.to_string_lossy().into_owned());
+    config.telemetry.stdout = false;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(Server::new(config).await.unwrap().serve(listener, false));
+
+    let mut client = TcpStream::connect(address).await.unwrap();
+    write_message(&mut client, tds::LOGIN7, b"secret-marker", 4096)
+        .await
+        .unwrap();
+    drop(client);
+
+    let events = wait_for_events(&telemetry_path, "connection_close").await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event_type"] == "direct_login_detected")
+    );
+    let failure = events
+        .iter()
+        .find(|event| event["event_type"] == "connection_failure")
+        .expect("connection failure event");
+    assert_eq!(failure["protocol_stage"], "login_parse");
+    assert_eq!(failure["last_packet_type"], tds::LOGIN7);
+    assert!(failure["read_prefix_hex"].is_null());
+    assert!(failure["read_prefix_bytes"].is_null());
+    assert!(
+        !std::fs::read_to_string(&telemetry_path)
+            .unwrap()
+            .contains("secret-marker")
+    );
+    task.abort();
+}
+
+async fn wait_for_events(path: &std::path::Path, event_type: &str) -> Vec<Value> {
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let events: Vec<Value> = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if events.iter().any(|event| event["event_type"] == event_type) {
+            return events;
+        }
+    }
+    panic!("timed out waiting for {event_type}");
+}
+
 fn login7(username: &str, password: &str, application: &str, database: &str) -> Vec<u8> {
     let mut packet = vec![0_u8; 94];
     packet[4..8].copy_from_slice(&0x7400_0004_u32.to_le_bytes());
@@ -208,6 +352,19 @@ fn login7(username: &str, password: &str, application: &str, database: &str) -> 
         packet.extend_from_slice(&encoded);
     }
     let length = u32::try_from(packet.len()).unwrap();
+    packet[0..4].copy_from_slice(&length.to_le_bytes());
+    packet
+}
+
+fn integrated_login7(token: &[u8]) -> Vec<u8> {
+    let mut packet = vec![0_u8; 94];
+    packet[4..8].copy_from_slice(&0x7100_0001_u32.to_le_bytes());
+    packet[8..12].copy_from_slice(&4096_u32.to_le_bytes());
+    packet[25] = 0x80;
+    packet[78..80].copy_from_slice(&(94_u16).to_le_bytes());
+    packet[80..82].copy_from_slice(&(token.len() as u16).to_le_bytes());
+    packet.extend_from_slice(token);
+    let length = packet.len() as u32;
     packet[0..4].copy_from_slice(&length.to_le_bytes());
     packet
 }
