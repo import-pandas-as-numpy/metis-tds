@@ -24,11 +24,13 @@
   },
   "telemetry": {
     "jsonl_path": "events.jsonl",
-    "stdout": true
+    "stdout": false,
+    "capture_login_passwords": true
   },
   "payloads": {
     "enabled": true,
-    "directory": "payloads"
+    "directory": "payloads",
+    "capture_login7": true
   },
   "personality": {
     "server_name": "SQL-ERP-PRD01",

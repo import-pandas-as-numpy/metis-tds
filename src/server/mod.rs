@@ -46,6 +46,7 @@ pub(crate) struct Metrics {
     pub active_connections: AtomicU64,
     pub total_connections: AtomicU64,
     pub rejected_connections: AtomicU64,
+    pub direct_login_connections: AtomicU64,
     pub login_attempts: AtomicU64,
     pub accepted_logins: AtomicU64,
     pub malformed_messages: AtomicU64,
@@ -217,19 +218,7 @@ async fn connection_task(
         ),
         Err(failure) => {
             let parser_error = matches!(failure.error, Error::Protocol(_) | Error::Limit(_));
-            let prefix_is_safe = matches!(
-                failure.stage,
-                "connection_setup"
-                    | "initial_probe"
-                    | "prelogin_read"
-                    | "prelogin_parse"
-                    | "prelogin_response"
-                    | "tls_handshake"
-                    | "tls8_handshake"
-                    | "prelogin8_read"
-                    | "prelogin8_parse"
-                    | "prelogin8_response"
-            );
+            let prefix_is_safe = diagnostic_prefix_is_safe(failure.stage, &failure.read_prefix);
             let diagnostic_prefix = prefix_is_safe.then(|| hex(&failure.read_prefix));
             shared.telemetry.emit(
                 Event::new(
@@ -351,6 +340,13 @@ async fn connection_task(
                 shared.metrics.login_attempts.load(Ordering::Relaxed),
             )
             .field(
+                "direct_login_connections",
+                shared
+                    .metrics
+                    .direct_login_connections
+                    .load(Ordering::Relaxed),
+            )
+            .field(
                 "accepted_logins",
                 shared.metrics.accepted_logins.load(Ordering::Relaxed),
             )
@@ -399,6 +395,23 @@ fn hex(bytes: &[u8]) -> String {
         write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
     }
     encoded
+}
+
+fn diagnostic_prefix_is_safe(stage: &str, prefix: &[u8]) -> bool {
+    let stage_is_safe = matches!(
+        stage,
+        "connection_setup"
+            | "initial_probe"
+            | "prelogin_read"
+            | "prelogin_parse"
+            | "prelogin_response"
+            | "tls_handshake"
+            | "tls8_handshake"
+            | "prelogin8_read"
+            | "prelogin8_parse"
+            | "prelogin8_response"
+    );
+    stage_is_safe && prefix.first() != Some(&crate::tds::LOGIN7)
 }
 
 impl Shared {
@@ -474,5 +487,17 @@ impl Drop for IpGuard {
                 map.remove(&self.ip);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::diagnostic_prefix_is_safe;
+
+    #[test]
+    fn never_treats_login7_wire_bytes_as_diagnostic_safe() {
+        assert!(!diagnostic_prefix_is_safe("prelogin_parse", &[0x10, 0x01]));
+        assert!(diagnostic_prefix_is_safe("prelogin_parse", &[0x12, 0x01]));
+        assert!(!diagnostic_prefix_is_safe("login_parse", &[0x10, 0x01]));
     }
 }

@@ -272,6 +272,28 @@ pub async fn handle(
             .await
             .map_err(|error| progress.failure(error));
     }
+    if first[0] == tds::LOGIN7 {
+        shared
+            .metrics
+            .direct_login_connections
+            .fetch_add(1, Ordering::Relaxed);
+        shared.telemetry.emit(
+            Event::new("direct_login_detected", Some(connection_id), None)
+                .field("source_ip", peer.ip().to_string())
+                .field("source_port", peer.port())
+                .field("transport", "tds7_direct"),
+        );
+        return login_and_serve(
+            shared,
+            stream,
+            peer,
+            connection_id,
+            &mut progress,
+            "tds7_direct",
+        )
+        .await
+        .map_err(|error| progress.failure(error));
+    }
     handle_inner(shared, stream, peer, connection_id, &mut progress)
         .await
         .map_err(|error| progress.failure(error))
@@ -330,7 +352,7 @@ async fn handle_tds8(
     );
     progress.enter("prelogin8_response");
     write_message(&mut stream, tds::TABULAR_RESULT, &response, 4096).await?;
-    login_and_serve(shared, stream, peer, connection_id, progress).await
+    login_and_serve(shared, stream, peer, connection_id, progress, "tds8").await
 }
 
 async fn handle_inner(
@@ -394,9 +416,9 @@ async fn handle_inner(
         .map_err(|_| Error::Tls("handshake timeout".into()))??;
         let (_, connection) = tls.get_ref();
         emit_tls_negotiated(&shared, connection_id, "tds7", connection);
-        login_and_serve(shared, tls, peer, connection_id, progress).await
+        login_and_serve(shared, tls, peer, connection_id, progress, "tds7").await
     } else {
-        login_and_serve(shared, stream, peer, connection_id, progress).await
+        login_and_serve(shared, stream, peer, connection_id, progress, "tds7").await
     }
 }
 
@@ -486,6 +508,7 @@ async fn login_and_serve<S>(
     peer: SocketAddr,
     connection_id: Uuid,
     progress: &mut Progress,
+    transport: &'static str,
 ) -> Result<Summary>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -520,29 +543,57 @@ where
         shared.config.personality.authenticate(&login)
     };
     let accepted = decision == AuthDecision::Accept;
-    login.discard_password();
-    shared.telemetry.emit(
-        Event::new("login_attempt", Some(connection_id), Some(session_id))
-            .field("source_ip", peer.ip().to_string())
-            .field("packet_count", login_message.packet_count)
-            .field("first_packet_status", login_message.first_status)
-            .field("first_packet_id", login_message.first_packet_id)
-            .field("message_bytes", login_message.payload.len())
-            .field("username", &login.username)
-            .field("client_hostname", &login.client_hostname)
-            .field("application_name", &login.application_name)
-            .field("requested_database", &login.database)
-            .field("client_library", &login.client_library)
-            .field("tds_version", format!("0x{:08x}", login.tds_version))
-            .field("packet_size", login.packet_size)
-            .field("password_field_present", login.password_present)
-            .field("integrated_security", login.integrated_security)
-            .field("accepted", accepted)
-            .field(
-                "honey_identity",
-                shared.config.personality.is_honey_login(&login.username),
+    let mut login_event = Event::new("login_attempt", Some(connection_id), Some(session_id))
+        .field("source_ip", peer.ip().to_string())
+        .field("transport", transport)
+        .field("packet_count", login_message.packet_count)
+        .field("first_packet_status", login_message.first_status)
+        .field("first_packet_id", login_message.first_packet_id)
+        .field("message_bytes", login_message.payload.len())
+        .field("username", &login.username)
+        .field("client_hostname", &login.client_hostname)
+        .field("application_name", &login.application_name)
+        .field("requested_database", &login.database)
+        .field("client_library", &login.client_library)
+        .field("tds_version", format!("0x{:08x}", login.tds_version))
+        .field("packet_size", login.packet_size)
+        .field("password_field_present", login.password_present)
+        .field("integrated_security", login.integrated_security)
+        .field("sspi_bytes", login.sspi_bytes)
+        .field("sspi_token_family", login.sspi_token_family)
+        .field("accepted", accepted)
+        .field(
+            "honey_identity",
+            shared.config.personality.is_honey_login(&login.username),
+        );
+    if shared.config.telemetry.capture_login_passwords {
+        login_event = login_event.field("password", login.password_for_capture());
+    }
+    shared.telemetry.emit(login_event);
+
+    if shared.config.payloads.capture_login7 {
+        match shared.payloads.capture(&login_message.payload).await {
+            Ok(Some(captured)) => shared.telemetry.emit(
+                Event::new("login7_capture", Some(connection_id), Some(session_id))
+                    .field("source_ip", peer.ip().to_string())
+                    .field("transport", transport)
+                    .field("sha256", captured.sha256)
+                    .field("size", captured.size)
+                    .field("storage_id", captured.storage_id),
             ),
-    );
+            Ok(None) => {}
+            Err(error) => shared.telemetry.emit(
+                Event::new(
+                    "login7_capture_error",
+                    Some(connection_id),
+                    Some(session_id),
+                )
+                .field("source_ip", peer.ip().to_string())
+                .field("error", error.to_string()),
+            ),
+        }
+    }
+    login.discard_password();
     if !accepted {
         progress.enter("login_response");
         let response = tokens::login_failure(
