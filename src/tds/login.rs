@@ -76,13 +76,13 @@ mod tests {
 
     #[test]
     fn parses_fixed_width_sql_auth_fields() {
-        let payload = login("scan-host", "sa", "gold", "pymssql", "143.244.215.213:1433");
+        let payload = login("scan-host", "sa", "gold", "pymssql", "203.0.113.10:1433");
         let parsed = parse(&payload).unwrap();
         assert_eq!(parsed.client_hostname, "scan-host");
         assert_eq!(parsed.username, "sa");
         assert_eq!(parsed.password_for_capture(), Some("gold"));
         assert_eq!(parsed.application_name, "pymssql");
-        assert_eq!(parsed.server_name, "143.244.215.213:1433");
+        assert_eq!(parsed.server_name, "203.0.113.10:1433");
         assert_eq!(parsed.client_library, "pymssql");
         assert_eq!(parsed.language, "us_english");
         assert_eq!(parsed.packet_size, 4096);

@@ -69,17 +69,36 @@ sudo systemctl status metis-tds
 
 Keep the configuration and TLS files read-only to the service. Only the log and payload directories should be writable. Do not mount a Docker socket, cloud credentials, package-manager credentials, domain credentials, or production files into the boundary.
 
-## OCI artifact on an isolated VPS
+## Source build on an isolated VPS
 
-The `Build deployment image` workflow creates a Linux/amd64 OCI archive as a short-lived GitHub Actions artifact. This provides a deployment path for hosts that should not receive repository or registry credentials:
+A public checkout can be built on the VPS without placing GitHub or registry credentials on the host. Build an exact reviewed tag or commit rather than a moving branch:
 
-1. Run the workflow against the exact revision to deploy and download `metis-tds.oci.tar` on a trusted workstation.
-2. Verify its checksum, copy only the archive and deployment configuration to the VPS, and import it with `podman load --input metis-tds.oci.tar`.
-3. Tag the imported image as `localhost/metis-tds:deploy`, then delete the transferred archive from the VPS.
-4. Install `deploy/nftables-container.conf` as `/etc/nftables.conf`, `deploy/metis-tds-container.service` as `/etc/systemd/system/metis-tds.service`, and `deploy/metis-tds.logrotate` as `/etc/logrotate.d/metis-tds`. The nftables file owns the host ruleset; merge its table into the existing policy instead if the host already has local firewall rules.
-5. Mount the chosen configuration and freshly generated decoy TLS material under `/etc/metis-tds`; neither is baked into the image.
+```console
+git clone --filter=blob:none https://github.com/import-pandas-as-numpy/metis-tds.git
+cd metis-tds
+git checkout --detach <reviewed-tag-or-commit>
+git verify-commit HEAD
+sudo podman build \
+  --build-arg VCS_REF="$(git rev-parse HEAD)" \
+  --tag localhost/metis-tds:candidate .
+```
 
-The container unit uses host networking so the host can filter new outbound traffic by UID. It also uses a read-only root filesystem, no capabilities, no-new-privileges, bounded CPU/memory/PIDs, and no container-runtime socket. `--pull=never` guarantees service restarts use the imported image without contacting a registry.
+`git verify-commit` succeeds only for signed commits. If the selected revision is not signed, compare `git rev-parse HEAD` with the full commit ID recorded in the reviewed GitHub pull request before building.
+
+Before switching the service, preserve the current deploy image and promote the candidate:
+
+```console
+sudo podman tag localhost/metis-tds:deploy localhost/metis-tds:rollback-<old-revision>
+sudo podman tag localhost/metis-tds:candidate localhost/metis-tds:deploy
+sudo systemctl restart metis-tds
+sudo systemctl is-active metis-tds
+```
+
+The checkout contains no authentication material and can be removed after the image is built. Do not configure a credential helper, personal access token, SSH deploy key, or authenticated registry on the honeypot host.
+
+Install `deploy/nftables-container.conf` as `/etc/nftables.conf`, `deploy/metis-tds-container.service` as `/etc/systemd/system/metis-tds.service`, and `deploy/metis-tds.logrotate` as `/etc/logrotate.d/metis-tds`. The nftables file owns the host ruleset; merge its table into the existing policy instead if the host already has local firewall rules. Mount the chosen configuration and freshly generated decoy TLS material under `/etc/metis-tds`; neither is baked into the image.
+
+The container unit uses host networking so the host can filter new outbound traffic by UID. It also uses a read-only root filesystem, no capabilities, no-new-privileges, bounded CPU/memory/PIDs, and no container-runtime socket. `--pull=never` guarantees service restarts use the locally built image without contacting a registry.
 
 ## Internet indexing
 

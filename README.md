@@ -1,8 +1,15 @@
 # Metis TDS honeypot
 
+[![CI](https://github.com/import-pandas-as-numpy/metis-tds/actions/workflows/ci.yml/badge.svg)](https://github.com/import-pandas-as-numpy/metis-tds/actions/workflows/ci.yml)
+[![zizmor](https://github.com/import-pandas-as-numpy/metis-tds/actions/workflows/zizmor.yml/badge.svg)](https://github.com/import-pandas-as-numpy/metis-tds/actions/workflows/zizmor.yml)
+[![License](https://img.shields.io/github/license/import-pandas-as-numpy/metis-tds)](LICENSE)
+
 Metis is a contained Microsoft SQL Server TDS 7.x/8.0 honeypot. It accepts real TDS connections, records login and request telemetry, classifies attacker intent, and returns synthetic SQL Server responses. It never executes submitted SQL, commands, assemblies, paths, or network destinations.
 
-The detailed requirements are in `mssql-tds-honeypot-spec.md`; verified progress and compatibility evidence are in `IMPLEMENTATION_LOG.md`.
+> [!CAUTION]
+> Metis receives untrusted network traffic and can deliberately record attacker-supplied credentials. Deploy it only on infrastructure you own or are authorized to operate, inside the containment boundary described below. It is pre-1.0 research software, not a database server or a security boundary by itself.
+
+The detailed requirements are in [the protocol specification](mssql-tds-honeypot-spec.md); verified progress and compatibility evidence are in [the implementation log](IMPLEMENTATION_LOG.md).
 
 Protocol behavior is implemented from Microsoft's current MS-TDS and MS-SSTDS open specifications. The project supports bounded multi-packet framing, TDS 4.2 LOGIN (`0x02`), PRELOGIN and direct LOGIN7, TDS 7.x-wrapped TLS 1.2/1.3, TDS 8.0 TLS-before-PRELOGIN with `tds/8.0` ALPN, SQL batches, common RPC parameters, stateful attacker-oriented semantics, synthetic result sets, JSONL telemetry, and bounded payload capture.
 
@@ -21,6 +28,8 @@ cp config/example.json config/local.json
 The example binds to `127.0.0.1:1433` to avoid accidental exposure. Change the address only after applying the deployment controls in `docs/deployment.md`.
 
 The example personality is entirely fictional and intentionally contains weak honey credentials for adversary interaction. Never reuse its domain, usernames, or passwords for a real identity or service.
+
+Do not expose the public example unchanged. Its server identity, users, schema, and seed records are visible in this repository and are therefore fingerprintable. Create a private deployment configuration with a distinct fictional organization, identities, values, and TLS material. Configuration belongs at deploy time and is never baked into the image.
 
 The research example enables `telemetry.capture_login_passwords` and `payloads.capture_login_messages`. Clear attempted passwords are written only to the mode-`0600` JSONL sink; validation forbids enabling that option while stdout telemetry is active. Every fully framed TDS 4.2 LOGIN or LOGIN7 message is stored before parsing as a mode-`0600` generated artifact, while ordinary failure events never include either login format's wire prefix. The older `payloads.capture_login7` key remains a backward-compatible alias.
 
@@ -44,6 +53,8 @@ docker run --read-only --cap-drop=ALL --security-opt=no-new-privileges \
 
 The image does not contain a deployment configuration. Supply one at runtime at `/etc/metis-tds/config.json`; for container networking its `listener.address` must use `0.0.0.0:1433`. Keep telemetry and captured-payload paths in the mounted data volumes. For an Internet-facing deployment, enable TLS and enforce outbound denial at the container or host network boundary.
 
+For a public repository deployment, an isolated VPS can anonymously clone an exact reviewed revision and build it locally without any GitHub or registry credentials. See [the source-build deployment procedure](docs/deployment.md#source-build-on-an-isolated-vps).
+
 ## Verification
 
 ```console
@@ -64,3 +75,17 @@ done
 ```
 
 The corpus directories are intentionally retained. On ptrace-restricted hosts where LeakSanitizer cannot perform its final process scan, build with `cargo +nightly fuzz build` and run the generated ASan-instrumented target with `ASAN_OPTIONS=detect_leaks=0`; do not disable AddressSanitizer itself.
+
+## Project policy
+
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+- [Code of conduct](CODE_OF_CONDUCT.md)
+- [Support](SUPPORT.md)
+- [Changelog](CHANGELOG.md)
+- [Secure deployment](docs/deployment.md)
+- [Public release checklist](docs/public-release-checklist.md)
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
