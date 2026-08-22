@@ -278,12 +278,8 @@ pub async fn handle(
         } else {
             "tds7_direct"
         };
-        shared
-            .metrics
-            .direct_login_connections
-            .fetch_add(1, Ordering::Relaxed);
         shared.telemetry.emit(
-            Event::new("direct_login_detected", Some(connection_id), None)
+            Event::new("direct_login_candidate", Some(connection_id), None)
                 .field("source_ip", peer.ip().to_string())
                 .field("source_port", peer.port())
                 .field("transport", transport)
@@ -531,6 +527,23 @@ where
     .await
     .map_err(|_| Error::Protocol("login message timeout".into()))??;
     progress.observe_message(&login_message);
+    if matches!(transport, "tds42_direct" | "tds7_direct") {
+        shared
+            .metrics
+            .direct_login_connections
+            .fetch_add(1, Ordering::Relaxed);
+        shared.telemetry.emit(
+            Event::new("direct_login_detected", Some(connection_id), None)
+                .field("source_ip", peer.ip().to_string())
+                .field("source_port", peer.port())
+                .field("transport", transport)
+                .field("packet_type", login_message.packet_type)
+                .field("packet_count", login_message.packet_count)
+                .field("first_packet_status", login_message.first_status)
+                .field("first_packet_id", login_message.first_packet_id)
+                .field("message_bytes", login_message.payload.len()),
+        );
+    }
     let legacy_login = login_message.packet_type == tds::LOGIN;
     let transport = match (transport, login_message.packet_type) {
         ("tds7", tds::LOGIN) => "tds42_after_prelogin",

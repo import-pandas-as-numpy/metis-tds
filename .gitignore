@@ -9,6 +9,7 @@ lcov.info
 # Runtime data
 *.jsonl
 /payloads/
+/scripts/local/
 
 # Local configuration and secrets
 /config/*.json

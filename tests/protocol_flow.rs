@@ -205,6 +205,18 @@ async fn direct_sql_login_captures_credentials_and_restricted_login7_artifact() 
     drop(client);
 
     let events = wait_for_events(&telemetry_path, "login_attempt").await;
+    let candidate = events
+        .iter()
+        .find(|event| event["event_type"] == "direct_login_candidate")
+        .expect("direct LOGIN7 candidate event");
+    assert_eq!(candidate["packet_type"], tds::LOGIN7);
+    let detected = events
+        .iter()
+        .find(|event| event["event_type"] == "direct_login_detected")
+        .expect("fully framed direct LOGIN7 event");
+    assert_eq!(detected["packet_type"], tds::LOGIN7);
+    assert_eq!(detected["message_bytes"], payload.len());
+    assert_eq!(detected["packet_count"], 1);
     let login = events
         .iter()
         .find(|event| event["event_type"] == "login_attempt")
@@ -446,6 +458,11 @@ async fn malformed_direct_login_never_enters_generic_wire_diagnostics() {
     assert!(
         events
             .iter()
+            .any(|event| event["event_type"] == "direct_login_candidate")
+    );
+    assert!(
+        events
+            .iter()
             .any(|event| event["event_type"] == "direct_login_detected")
     );
     let failure = events
@@ -460,6 +477,117 @@ async fn malformed_direct_login_never_enters_generic_wire_diagnostics() {
         !std::fs::read_to_string(&telemetry_path)
             .unwrap()
             .contains("secret-marker")
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn impossible_direct_login_header_is_only_a_candidate_with_safe_header_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let telemetry_path = temp.path().join("events.jsonl");
+    let mut config = Config::default();
+    config.listener.address = "127.0.0.1:0".into();
+    config.telemetry.jsonl_path = Some(telemetry_path.to_string_lossy().into_owned());
+    config.telemetry.stdout = false;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(Server::new(config).await.unwrap().serve(listener, false));
+
+    let malformed_header = [tds::LOGIN7, 0x0f, 0x00, 0x04, 0xaa, 0xbb, 0x54, 0x00];
+    let mut client = TcpStream::connect(address).await.unwrap();
+    client.write_all(&malformed_header).await.unwrap();
+    drop(client);
+
+    let events = wait_for_events(&telemetry_path, "connection_close").await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event_type"] == "direct_login_candidate")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event_type"] == "direct_login_detected")
+    );
+    let failure = events
+        .iter()
+        .find(|event| event["event_type"] == "connection_failure")
+        .expect("connection failure event");
+    assert_eq!(failure["protocol_stage"], "login_read");
+    assert_eq!(
+        failure["error"],
+        "TDS protocol error: invalid TDS packet length 4 (type=0x10, status=0x0f, packet_id=84)"
+    );
+    assert!(failure["read_prefix_hex"].is_null());
+    assert!(failure["read_prefix_bytes"].is_null());
+    assert_eq!(failure["direct_login_header_hex"], "100f0004aabb5400");
+    assert_eq!(failure["direct_login_header_bytes"], 8);
+    assert_eq!(failure["direct_login_header_complete"], true);
+    let malformed = events
+        .iter()
+        .find(|event| event["event_type"] == "malformed_tds_message")
+        .expect("malformed TDS event");
+    assert_eq!(malformed["direct_login_header_hex"], "100f0004aabb5400");
+    task.abort();
+}
+
+#[tokio::test]
+async fn framed_malformed_login7_is_detected_archived_and_field_diagnosed() {
+    let temp = tempfile::tempdir().unwrap();
+    let telemetry_path = temp.path().join("events.jsonl");
+    let payload_directory = temp.path().join("payloads");
+    let mut config = Config::default();
+    config.listener.address = "127.0.0.1:0".into();
+    config.telemetry.jsonl_path = Some(telemetry_path.to_string_lossy().into_owned());
+    config.telemetry.stdout = false;
+    config.payloads.enabled = true;
+    config.payloads.capture_login_messages = true;
+    config.payloads.directory = payload_directory.to_string_lossy().into_owned();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(Server::new(config).await.unwrap().serve(listener, false));
+
+    let mut payload = vec![0_u8; 147];
+    payload[0..4].copy_from_slice(&147_u32.to_le_bytes());
+    payload[40..42].copy_from_slice(&146_u16.to_le_bytes());
+    payload[42..44].copy_from_slice(&2_u16.to_le_bytes());
+    let mut client = TcpStream::connect(address).await.unwrap();
+    write_message(&mut client, tds::LOGIN7, &payload, 4096)
+        .await
+        .unwrap();
+    drop(client);
+
+    let events = wait_for_events(&telemetry_path, "connection_close").await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event_type"] == "direct_login_candidate")
+    );
+    let detected = events
+        .iter()
+        .find(|event| event["event_type"] == "direct_login_detected")
+        .expect("fully framed direct LOGIN7 event");
+    assert_eq!(detected["message_bytes"], 147);
+    let capture = events
+        .iter()
+        .find(|event| event["event_type"] == "login_message_capture")
+        .expect("pre-parse LOGIN7 artifact");
+    let stored = payload_directory.join(format!("{}.bin", capture["storage_id"].as_str().unwrap()));
+    assert_eq!(std::fs::read(stored).unwrap(), payload);
+    let failure = events
+        .iter()
+        .find(|event| event["event_type"] == "connection_failure")
+        .expect("connection failure event");
+    assert_eq!(failure["protocol_stage"], "login_parse");
+    assert_eq!(
+        failure["error"],
+        "TDS protocol error: LOGIN7 username field is outside message (offset=146, bytes=4, declared=147)"
+    );
+    assert!(failure["direct_login_header_hex"].is_null());
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event_type"] == "login_attempt")
     );
     task.abort();
 }

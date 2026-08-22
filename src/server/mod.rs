@@ -223,6 +223,11 @@ async fn connection_task(
             let parser_error = matches!(failure.error, Error::Protocol(_) | Error::Limit(_));
             let prefix_is_safe = diagnostic_prefix_is_safe(failure.stage, &failure.read_prefix);
             let diagnostic_prefix = prefix_is_safe.then(|| hex(&failure.read_prefix));
+            let direct_login_header =
+                direct_login_header_prefix(failure.stage, &failure.read_prefix);
+            let direct_login_header_hex = direct_login_header.map(hex);
+            let direct_login_header_bytes = direct_login_header.map(<[u8]>::len);
+            let direct_login_header_complete = direct_login_header.map(|header| header.len() == 8);
             shared.telemetry.emit(
                 Event::new(
                     "connection_failure",
@@ -254,7 +259,10 @@ async fn connection_task(
                         failure.bytes_read
                             > u64::try_from(failure.read_prefix.len()).unwrap_or(u64::MAX),
                     ),
-                ),
+                )
+                .field("direct_login_header_hex", &direct_login_header_hex)
+                .field("direct_login_header_bytes", direct_login_header_bytes)
+                .field("direct_login_header_complete", direct_login_header_complete),
             );
             if parser_error {
                 shared
@@ -280,7 +288,10 @@ async fn connection_task(
                     .field("last_first_status", failure.last_first_status)
                     .field("last_first_packet_id", failure.last_first_packet_id)
                     .field("last_packet_count", failure.last_packet_count)
-                    .field("last_message_bytes", failure.last_message_bytes),
+                    .field("last_message_bytes", failure.last_message_bytes)
+                    .field("direct_login_header_hex", direct_login_header_hex)
+                    .field("direct_login_header_bytes", direct_login_header_bytes)
+                    .field("direct_login_header_complete", direct_login_header_complete),
                 );
             }
             tracing::debug!(
@@ -425,6 +436,15 @@ fn diagnostic_prefix_is_safe(stage: &str, prefix: &[u8]) -> bool {
         )
 }
 
+fn direct_login_header_prefix<'a>(stage: &str, prefix: &'a [u8]) -> Option<&'a [u8]> {
+    (stage == "login_read"
+        && matches!(
+            prefix.first(),
+            Some(&crate::tds::LOGIN) | Some(&crate::tds::LOGIN7)
+        ))
+    .then(|| &prefix[..prefix.len().min(8)])
+}
+
 impl Shared {
     pub fn record_login_attempt(&self, ip: IpAddr) -> u64 {
         let mut attempts = self
@@ -513,7 +533,7 @@ impl Drop for IpGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::diagnostic_prefix_is_safe;
+    use super::{diagnostic_prefix_is_safe, direct_login_header_prefix};
 
     #[test]
     fn never_treats_login_wire_bytes_as_diagnostic_safe() {
@@ -521,5 +541,24 @@ mod tests {
         assert!(!diagnostic_prefix_is_safe("prelogin_parse", &[0x10, 0x01]));
         assert!(diagnostic_prefix_is_safe("prelogin_parse", &[0x12, 0x01]));
         assert!(!diagnostic_prefix_is_safe("login_parse", &[0x10, 0x01]));
+    }
+
+    #[test]
+    fn exposes_only_the_tds_header_for_direct_login_read_failures() {
+        let bytes = [0x10, 0x0f, 0x00, 0x04, 0xaa, 0xbb, 0x54, 0x00, 0xde, 0xad];
+        assert_eq!(
+            direct_login_header_prefix("login_read", &bytes),
+            Some(&bytes[..8])
+        );
+        assert_eq!(direct_login_header_prefix("login_parse", &bytes), None);
+        let partial = [0x10, 0x01, 0x00, 0x20];
+        assert_eq!(
+            direct_login_header_prefix("login_read", &partial),
+            Some(partial.as_slice())
+        );
+        assert_eq!(
+            direct_login_header_prefix("login_read", &[0x12, 0x01]),
+            None
+        );
     }
 }
