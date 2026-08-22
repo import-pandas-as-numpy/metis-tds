@@ -287,10 +287,11 @@ If authentication capture is enabled for research use, credentials must be:
 - written only to a restricted mode-`0600` JSONL sink with stdout disabled,
 - excluded from ordinary parser-error and container-runtime logs.
 
-Complete LOGIN7 messages may also be retained as bounded, generated mode-`0600`
-artifacts. The corresponding ordinary event contains only the artifact identifier,
-size, and SHA-256 digest. Operators must treat both credential telemetry and
-LOGIN7 artifacts as sensitive evidence and apply access control and retention.
+Complete TDS 4.2 LOGIN and LOGIN7 messages may also be retained before parsing
+as bounded, generated mode-`0600` artifacts. The corresponding ordinary event
+contains only the artifact identifier, size, packet type, and SHA-256 digest.
+Operators must treat both credential telemetry and login-message artifacts as
+sensitive evidence and apply access control and retention.
 
 ### 7.6 Authentication Behavior
 
@@ -783,13 +784,13 @@ Capture:
 }
 ```
 
-Do not include raw LOGIN7 bytes or password material in parser-error telemetry.
+Do not include raw TDS 4.2 LOGIN, LOGIN7, or password material in parser-error telemetry.
 
 Every failed connection also emits `connection_failure` with stage-local byte
-counts and the last successfully framed message metadata. Failures before a
-LOGIN7 could contain credentials may include at most the first 256 received
-wire bytes as hexadecimal for protocol identification. LOGIN7 and later stages
-must never include a raw wire prefix.
+counts and the last successfully framed message metadata. Diagnostic prefixes
+may contain at most the first 256 received wire bytes for protocol
+identification, but are suppressed whenever the first packet is either TDS 4.2
+LOGIN (`0x02`) or LOGIN7 (`0x10`) and throughout login-or-later stages.
 
 ### 15.8 Connection Close
 
@@ -1143,7 +1144,7 @@ telemetry:
 payloads:
   enabled: true
   directory: "/var/lib/tdshoney/payloads"
-  capture_login7: true
+  capture_login_messages: true
 ```
 
 ---

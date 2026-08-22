@@ -30,7 +30,7 @@
   "payloads": {
     "enabled": true,
     "directory": "payloads",
-    "capture_login7": true
+    "capture_login_messages": true
   },
   "personality": {
     "server_name": "SQL-ERP-PRD01",

@@ -84,6 +84,7 @@ mod tests {
             PayloadConfig {
                 enabled: true,
                 directory: temp.path().to_string_lossy().into_owned(),
+                capture_login_messages: false,
                 capture_login7: false,
             },
             100,

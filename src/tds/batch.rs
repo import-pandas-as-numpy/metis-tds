@@ -18,6 +18,13 @@ pub fn decode(payload: &[u8], max_bytes: usize) -> Result<String> {
     .collect())
 }
 
+pub fn decode_legacy(payload: &[u8], max_bytes: usize) -> Result<String> {
+    if payload.len() > max_bytes {
+        return Err(Error::Limit("maximum SQL batch size"));
+    }
+    Ok(String::from_utf8_lossy(payload).into_owned())
+}
+
 pub fn strip_all_headers(payload: &[u8]) -> Result<&[u8]> {
     if payload.len() < 4 {
         return Ok(payload);
@@ -47,5 +54,13 @@ mod tests {
             .flat_map(u16::to_le_bytes)
             .collect();
         assert_eq!(decode(&raw, 1024).unwrap(), "SELECT @@VERSION");
+    }
+
+    #[test]
+    fn decodes_legacy_single_byte_sql() {
+        assert_eq!(
+            decode_legacy(b"SELECT @@VERSION", 1024).unwrap(),
+            "SELECT @@VERSION"
+        );
     }
 }

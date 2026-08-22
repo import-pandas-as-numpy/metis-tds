@@ -189,7 +189,7 @@ async fn direct_sql_login_captures_credentials_and_restricted_login7_artifact() 
     config.telemetry.stdout = false;
     config.telemetry.capture_login_passwords = true;
     config.payloads.enabled = true;
-    config.payloads.capture_login7 = true;
+    config.payloads.capture_login_messages = true;
     config.payloads.directory = payload_directory.to_string_lossy().into_owned();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -204,7 +204,7 @@ async fn direct_sql_login_captures_credentials_and_restricted_login7_artifact() 
     assert!(response.payload.contains(&0xad));
     drop(client);
 
-    let events = wait_for_events(&telemetry_path, "login7_capture").await;
+    let events = wait_for_events(&telemetry_path, "login_attempt").await;
     let login = events
         .iter()
         .find(|event| event["event_type"] == "login_attempt")
@@ -214,7 +214,7 @@ async fn direct_sql_login_captures_credentials_and_restricted_login7_artifact() 
     assert_eq!(login["password"], "Password123!");
     let capture = events
         .iter()
-        .find(|event| event["event_type"] == "login7_capture")
+        .find(|event| event["event_type"] == "login_message_capture")
         .expect("LOGIN7 capture event");
     let stored = payload_directory.join(format!("{}.bin", capture["storage_id"].as_str().unwrap()));
     let metadata = std::fs::metadata(&stored).unwrap();
@@ -224,6 +224,101 @@ async fn direct_sql_login_captures_credentials_and_restricted_login7_artifact() 
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     }
     assert_eq!(std::fs::read(stored).unwrap(), payload);
+    task.abort();
+}
+
+#[tokio::test]
+async fn legacy_direct_login_captures_password_and_enters_authentication() {
+    let temp = tempfile::tempdir().unwrap();
+    let telemetry_path = temp.path().join("events.jsonl");
+    let payload_directory = temp.path().join("payloads");
+    let mut config = Config::default();
+    config.listener.address = "127.0.0.1:0".into();
+    config.telemetry.jsonl_path = Some(telemetry_path.to_string_lossy().into_owned());
+    config.telemetry.stdout = false;
+    config.telemetry.capture_login_passwords = true;
+    config.payloads.enabled = true;
+    config.payloads.capture_login_messages = true;
+    config.payloads.directory = payload_directory.to_string_lossy().into_owned();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(Server::new(config).await.unwrap().serve(listener, false));
+
+    let payload = legacy_login("143.244.215.213:1433", "sa", "gold", "pymssql");
+    let mut client = TcpStream::connect(address).await.unwrap();
+    write_message(&mut client, tds::LOGIN, &payload, 4096)
+        .await
+        .unwrap();
+    let response = read_message(&mut client, 4096, 65_536).await.unwrap();
+    assert!(response.payload.contains(&0xad));
+    drop(client);
+
+    let events = wait_for_events(&telemetry_path, "login_attempt").await;
+    let login = events
+        .iter()
+        .find(|event| event["event_type"] == "login_attempt")
+        .expect("legacy login attempt");
+    assert_eq!(login["transport"], "tds42_direct");
+    assert_eq!(login["login_format"], "tds42_login");
+    assert_eq!(login["packet_type"], tds::LOGIN);
+    assert_eq!(login["username"], "sa");
+    assert_eq!(login["password"], "gold");
+    assert_eq!(login["application_name"], "pymssql");
+    assert_eq!(login["client_library"], "pymssql");
+    assert_eq!(login["tds_version"], "0x04020000");
+    let capture = events
+        .iter()
+        .find(|event| event["event_type"] == "login_message_capture")
+        .expect("legacy login artifact");
+    assert_eq!(capture["login_format"], "tds42_login");
+    let stored = payload_directory.join(format!("{}.bin", capture["storage_id"].as_str().unwrap()));
+    assert_eq!(std::fs::read(stored).unwrap(), payload);
+    task.abort();
+}
+
+#[tokio::test]
+async fn malformed_legacy_login_is_archived_but_not_copied_to_failure_diagnostics() {
+    let temp = tempfile::tempdir().unwrap();
+    let telemetry_path = temp.path().join("events.jsonl");
+    let payload_directory = temp.path().join("payloads");
+    let mut config = Config::default();
+    config.listener.address = "127.0.0.1:0".into();
+    config.telemetry.jsonl_path = Some(telemetry_path.to_string_lossy().into_owned());
+    config.telemetry.stdout = false;
+    config.payloads.enabled = true;
+    config.payloads.capture_login_messages = true;
+    config.payloads.directory = payload_directory.to_string_lossy().into_owned();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(Server::new(config).await.unwrap().serve(listener, false));
+
+    let payload = b"legacy-credential-marker";
+    let mut client = TcpStream::connect(address).await.unwrap();
+    write_message(&mut client, tds::LOGIN, payload, 4096)
+        .await
+        .unwrap();
+    drop(client);
+
+    let events = wait_for_events(&telemetry_path, "connection_close").await;
+    let capture = events
+        .iter()
+        .find(|event| event["event_type"] == "login_message_capture")
+        .expect("pre-parse login artifact");
+    assert_eq!(capture["packet_type"], tds::LOGIN);
+    let stored = payload_directory.join(format!("{}.bin", capture["storage_id"].as_str().unwrap()));
+    assert_eq!(std::fs::read(stored).unwrap(), payload);
+    let failure = events
+        .iter()
+        .find(|event| event["event_type"] == "connection_failure")
+        .expect("connection failure event");
+    assert_eq!(failure["protocol_stage"], "login_parse");
+    assert!(failure["read_prefix_hex"].is_null());
+    assert!(failure["read_prefix_bytes"].is_null());
+    assert!(
+        !std::fs::read_to_string(&telemetry_path)
+            .unwrap()
+            .contains("legacy-credential-marker")
+    );
     task.abort();
 }
 
@@ -367,6 +462,26 @@ fn integrated_login7(token: &[u8]) -> Vec<u8> {
     let length = packet.len() as u32;
     packet[0..4].copy_from_slice(&length.to_le_bytes());
     packet
+}
+
+fn legacy_login(host: &str, username: &str, password: &str, application: &str) -> Vec<u8> {
+    let mut payload = vec![0_u8; 572];
+    put_legacy_field(&mut payload, 0, 30, host);
+    put_legacy_field(&mut payload, 31, 61, username);
+    put_legacy_field(&mut payload, 62, 92, password);
+    payload[123] = 4;
+    put_legacy_field(&mut payload, 140, 170, application);
+    put_legacy_field(&mut payload, 171, 201, "143.244.215.213:1433");
+    payload[458..462].copy_from_slice(&0x0402_0000_u32.to_be_bytes());
+    put_legacy_field(&mut payload, 462, 472, "pymssql");
+    put_legacy_field(&mut payload, 480, 510, "us_english");
+    put_legacy_field(&mut payload, 557, 563, "4096");
+    payload
+}
+
+fn put_legacy_field(payload: &mut [u8], offset: usize, length_offset: usize, value: &str) {
+    payload[offset..offset + value.len()].copy_from_slice(value.as_bytes());
+    payload[length_offset] = value.len() as u8;
 }
 
 fn contains_utf16(haystack: &[u8], needle: &str) -> bool {

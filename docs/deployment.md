@@ -15,7 +15,7 @@ sudo install -o root -g metis-tds -m 0640 config/example.json /etc/metis-tds/con
 
 Set `listener.address` to `0.0.0.0:1433`, move telemetry and payload paths under the directories above, and configure a decoy personality. Never use a real username/password pair or an identity that exists elsewhere.
 
-For credential research, `telemetry.capture_login_passwords` deliberately records parsed SQL-auth passwords in the JSONL sink and requires `telemetry.stdout=false`. `payloads.capture_login7` retains the complete attacker-supplied LOGIN7 message as a generated mode-`0600` artifact and requires payload capture to be enabled. Treat both directories as sensitive evidence: restrict access, set retention, and keep them out of container logs and routine log shipping. Generic parser-failure telemetry remains credential-blind.
+For credential research, `telemetry.capture_login_passwords` deliberately records parsed SQL-auth passwords in the JSONL sink and requires `telemetry.stdout=false`. `payloads.capture_login_messages` retains every fully framed attacker-supplied TDS 4.2 LOGIN or LOGIN7 message before parsing as a generated mode-`0600` artifact and requires payload capture to be enabled. The older `capture_login7` key remains an alias for existing configurations. Treat both directories as sensitive evidence: restrict access, set retention, and keep them out of container logs and routine log shipping. Generic parser-failure telemetry remains credential-blind.
 
 ## TLS
 

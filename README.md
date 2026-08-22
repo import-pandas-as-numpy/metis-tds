@@ -4,11 +4,11 @@ Metis is a contained Microsoft SQL Server TDS 7.x/8.0 honeypot. It accepts real 
 
 The detailed requirements are in `mssql-tds-honeypot-spec.md`; verified progress and compatibility evidence are in `IMPLEMENTATION_LOG.md`.
 
-Protocol behavior is implemented from Microsoft's current MS-TDS open specification. The project supports bounded multi-packet framing, PRELOGIN and legacy direct LOGIN7, TDS 7.x-wrapped TLS 1.2/1.3, TDS 8.0 TLS-before-PRELOGIN with `tds/8.0` ALPN, SQL batches, common RPC parameters, stateful attacker-oriented semantics, synthetic result sets, JSONL telemetry, and bounded payload capture.
+Protocol behavior is implemented from Microsoft's current MS-TDS and MS-SSTDS open specifications. The project supports bounded multi-packet framing, TDS 4.2 LOGIN (`0x02`), PRELOGIN and direct LOGIN7, TDS 7.x-wrapped TLS 1.2/1.3, TDS 8.0 TLS-before-PRELOGIN with `tds/8.0` ALPN, SQL batches, common RPC parameters, stateful attacker-oriented semantics, synthetic result sets, JSONL telemetry, and bounded payload capture.
 
 ## Safety boundary
 
-Run this as an unprivileged, isolated service with outbound traffic denied. The runtime intentionally contains no subprocess or generic command-execution facility. Submitted binary material is bounded, hashed, and stored under generated names with mode `0600` when payload capture is enabled. LOGIN7 password and full-message capture are separately opt-in; captured credentials are attacker-supplied research data, never deployment credentials.
+Run this as an unprivileged, isolated service with outbound traffic denied. The runtime intentionally contains no subprocess or generic command-execution facility. Submitted binary material is bounded, hashed, and stored under generated names with mode `0600` when payload capture is enabled. Login-password and full-message capture are separately opt-in; captured credentials are attacker-supplied research data, never deployment credentials.
 
 ## Quick start
 
@@ -22,7 +22,7 @@ The example binds to `127.0.0.1:1433` to avoid accidental exposure. Change the a
 
 The example personality is entirely fictional and intentionally contains weak honey credentials for adversary interaction. Never reuse its domain, usernames, or passwords for a real identity or service.
 
-The research example enables `telemetry.capture_login_passwords` and `payloads.capture_login7`. Clear attempted passwords are written only to the mode-`0600` JSONL sink; validation forbids enabling that option while stdout telemetry is active. Full LOGIN7 messages are stored as mode-`0600` generated artifacts, while ordinary failure events never include LOGIN7 wire prefixes.
+The research example enables `telemetry.capture_login_passwords` and `payloads.capture_login_messages`. Clear attempted passwords are written only to the mode-`0600` JSONL sink; validation forbids enabling that option while stdout telemetry is active. Every fully framed TDS 4.2 LOGIN or LOGIN7 message is stored before parsing as a mode-`0600` generated artifact, while ordinary failure events never include either login format's wire prefix. The older `payloads.capture_login7` key remains a backward-compatible alias.
 
 TLS certificate conversion, systemd hardening, outbound-deny guidance, and Internet-indexing caveats are in `docs/deployment.md`.
 

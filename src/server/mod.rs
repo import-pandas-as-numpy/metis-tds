@@ -411,7 +411,11 @@ fn diagnostic_prefix_is_safe(stage: &str, prefix: &[u8]) -> bool {
             | "prelogin8_parse"
             | "prelogin8_response"
     );
-    stage_is_safe && prefix.first() != Some(&crate::tds::LOGIN7)
+    stage_is_safe
+        && !matches!(
+            prefix.first(),
+            Some(&crate::tds::LOGIN) | Some(&crate::tds::LOGIN7)
+        )
 }
 
 impl Shared {
@@ -495,7 +499,8 @@ mod tests {
     use super::diagnostic_prefix_is_safe;
 
     #[test]
-    fn never_treats_login7_wire_bytes_as_diagnostic_safe() {
+    fn never_treats_login_wire_bytes_as_diagnostic_safe() {
+        assert!(!diagnostic_prefix_is_safe("prelogin_parse", &[0x02, 0x01]));
         assert!(!diagnostic_prefix_is_safe("prelogin_parse", &[0x10, 0x01]));
         assert!(diagnostic_prefix_is_safe("prelogin_parse", &[0x12, 0x01]));
         assert!(!diagnostic_prefix_is_safe("login_parse", &[0x10, 0x01]));
