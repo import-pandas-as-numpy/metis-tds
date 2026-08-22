@@ -4,6 +4,12 @@ All notable user-visible changes are documented here. The project follows [Seman
 
 ## Unreleased
 
+## 0.1.1 - 2026-08-22
+
+### Security
+
+- Remove Tiberius's unused Windows integrated-authentication feature from the test dependency graph, eliminating the vulnerable `rand` 0.7.3 lockfile entry.
+
 ## 0.1.0 - 2026-08-22
 
 ### Added
