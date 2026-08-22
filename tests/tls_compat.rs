@@ -7,7 +7,7 @@ use metis_tds::{
     tds::{
         self,
         packet::{read_message, write_message},
-        prelogin::{Encryption, encode_response},
+        prelogin::{Encryption, encode_request},
     },
 };
 use rustls::{
@@ -110,7 +110,7 @@ async fn tiberius_negotiates_tds_wrapped_tls_and_queries() {
     write_message(
         &mut incomplete_tls,
         tds::PRELOGIN,
-        &encode_response(Encryption::On, ""),
+        &encode_request(Encryption::On, ""),
         4096,
     )
     .await
@@ -242,13 +242,15 @@ async fn tds8_raw_tls_precedes_prelogin_and_login7() {
     write_message(
         &mut tls,
         tds::PRELOGIN,
-        &encode_response(Encryption::Required, "MSSQLSERVER"),
+        &encode_request(Encryption::Required, "MSSQLSERVER"),
         4096,
     )
     .await
     .unwrap();
     let prelogin_response = read_message(&mut tls, 4096, 65_536).await.unwrap();
     assert_eq!(prelogin_response.packet_type, tds::TABULAR_RESULT);
+    assert_eq!(prelogin_response.payload.len(), 39);
+    assert_eq!(prelogin_response.payload[33], 0);
     let parsed = tds::prelogin::parse(&prelogin_response.payload).unwrap();
     assert_eq!(parsed.encryption, Some(Encryption::Required));
 
