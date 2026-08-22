@@ -35,7 +35,7 @@ cargo deny check
 cargo deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check
 ```
 
-CI also checks the declared Rust 1.85 minimum supported version and builds the production container.
+CI also checks the declared Rust 1.85 minimum supported version, builds and vulnerability-scans the production container, and retains an SPDX SBOM artifact for each run.
 
 ## Pull requests
 
