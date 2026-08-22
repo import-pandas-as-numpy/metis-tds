@@ -339,6 +339,10 @@ async fn handle_tds8(
         ));
     }
     let prelogin = tds::prelogin::parse(&prelogin_message.payload)?;
+    let instance_matches = instance_matches(
+        prelogin.instance.as_deref(),
+        &shared.config.personality.instance_name,
+    );
     emit_prelogin(
         &shared,
         peer,
@@ -348,10 +352,7 @@ async fn handle_tds8(
         Encryption::Required,
         "tds8",
     );
-    let response = tds::prelogin::encode_response(
-        Encryption::Required,
-        &shared.config.personality.instance_name,
-    );
+    let response = tds::prelogin::encode_response(Encryption::Required, instance_matches);
     progress.enter("prelogin8_response");
     write_message(&mut stream, tds::TABULAR_RESULT, &response, 4096).await?;
     login_and_serve(shared, stream, peer, connection_id, progress, "tds8").await
@@ -383,6 +384,10 @@ async fn handle_inner(
     let prelogin = tds::prelogin::parse(&prelogin_message.payload)?;
     let requested_encryption = prelogin.encryption.unwrap_or(Encryption::Off);
     let (response_encryption, use_tls) = negotiate(shared.config.tls.mode, requested_encryption);
+    let instance_matches = instance_matches(
+        prelogin.instance.as_deref(),
+        &shared.config.personality.instance_name,
+    );
     emit_prelogin(
         &shared,
         peer,
@@ -392,10 +397,7 @@ async fn handle_inner(
         response_encryption,
         "tds7",
     );
-    let response = tds::prelogin::encode_response(
-        response_encryption,
-        &shared.config.personality.instance_name,
-    );
+    let response = tds::prelogin::encode_response(response_encryption, instance_matches);
     progress.enter("prelogin_response");
     write_message(&mut stream, tds::TABULAR_RESULT, &response, 4096).await?;
 
@@ -454,6 +456,13 @@ fn emit_prelogin(
             )
             .field("mars_requested", prelogin.mars)
             .field("instance", &prelogin.instance)
+            .field(
+                "instance_matches",
+                instance_matches(
+                    prelogin.instance.as_deref(),
+                    &shared.config.personality.instance_name,
+                ),
+            )
             .field("unknown_tokens", &prelogin.unknown_tokens),
     );
 }
@@ -500,8 +509,18 @@ fn negotiate(mode: TlsMode, client: Encryption) -> (Encryption, bool) {
             Encryption::NotSupported => (Encryption::NotSupported, false),
             _ => (Encryption::On, true),
         },
-        TlsMode::Required => (Encryption::Required, client != Encryption::NotSupported),
+        TlsMode::Required => match client {
+            Encryption::Off | Encryption::NotSupported => {
+                (Encryption::Required, client != Encryption::NotSupported)
+            }
+            Encryption::On | Encryption::Required => (Encryption::On, true),
+        },
     }
+}
+
+fn instance_matches(requested: Option<&str>, configured: &str) -> bool {
+    requested
+        .is_none_or(|requested| requested.is_empty() || requested.eq_ignore_ascii_case(configured))
 }
 
 async fn login_and_serve<S>(
@@ -965,4 +984,38 @@ fn hex_version(v: [u8; 6]) -> String {
         "{:02x}.{:02x}.{:02x}.{:02x}-{:02x}{:02x}",
         v[0], v[1], v[2], v[3], v[4], v[5]
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{instance_matches, negotiate};
+    use crate::{config::TlsMode, tds::prelogin::Encryption};
+
+    #[test]
+    fn instance_matching_follows_prelogin_rules() {
+        assert!(instance_matches(None, "MSSQLSERVER"));
+        assert!(instance_matches(Some(""), "MSSQLSERVER"));
+        assert!(instance_matches(Some("mssqlserver"), "MSSQLSERVER"));
+        assert!(!instance_matches(Some("REPORTING"), "MSSQLSERVER"));
+    }
+
+    #[test]
+    fn required_tls_uses_the_specified_response_matrix() {
+        assert_eq!(
+            negotiate(TlsMode::Required, Encryption::Off),
+            (Encryption::Required, true)
+        );
+        assert_eq!(
+            negotiate(TlsMode::Required, Encryption::On),
+            (Encryption::On, true)
+        );
+        assert_eq!(
+            negotiate(TlsMode::Required, Encryption::Required),
+            (Encryption::On, true)
+        );
+        assert_eq!(
+            negotiate(TlsMode::Required, Encryption::NotSupported),
+            (Encryption::Required, false)
+        );
+    }
 }

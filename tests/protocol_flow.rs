@@ -6,7 +6,7 @@ use metis_tds::{
     tds::{
         self,
         packet::{read_message, write_message},
-        prelogin::{Encryption, encode_response},
+        prelogin::{Encryption, encode_request},
     },
 };
 use serde_json::Value;
@@ -30,12 +30,14 @@ async fn plaintext_login_and_discovery_query_complete() {
     let task = tokio::spawn(server.serve(listener, false));
 
     let mut client = TcpStream::connect(address).await.unwrap();
-    let prelogin = encode_response(Encryption::Off, "MSSQLSERVER");
+    let prelogin = encode_request(Encryption::Off, "MSSQLSERVER");
     write_message(&mut client, tds::PRELOGIN, &prelogin, 4096)
         .await
         .unwrap();
     let response = read_message(&mut client, 4096, 65_536).await.unwrap();
     assert_eq!(response.packet_type, tds::TABULAR_RESULT);
+    assert_eq!(response.payload.len(), 39);
+    assert_eq!(response.payload[33], 0);
     let parsed = tds::prelogin::parse(&response.payload).unwrap();
     assert_eq!(parsed.encryption, Some(Encryption::NotSupported));
 
@@ -65,6 +67,7 @@ async fn plaintext_login_and_discovery_query_complete() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     let telemetry = std::fs::read_to_string(&telemetry_path).unwrap();
     assert!(telemetry.contains("\"event_type\":\"connection_open\""));
+    assert!(telemetry.contains("\"instance_matches\":true"));
     assert!(telemetry.contains("\"event_type\":\"login_attempt\""));
     assert!(telemetry.contains("\"raw_sql\":\"SELECT @@VERSION\""));
     assert!(telemetry.contains("\"event_type\":\"connection_close\""));
@@ -85,7 +88,7 @@ async fn rejected_login_never_echoes_password() {
     write_message(
         &mut client,
         tds::PRELOGIN,
-        &encode_response(Encryption::Off, ""),
+        &encode_request(Encryption::Off, ""),
         4096,
     )
     .await

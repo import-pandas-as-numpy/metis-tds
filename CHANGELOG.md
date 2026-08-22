@@ -4,6 +4,17 @@ All notable user-visible changes are documented here. The project follows [Seman
 
 ## Unreleased
 
+## 0.1.4 - 2026-08-22
+
+### Fixed
+
+- Encode PRELOGIN instance validation as the one-byte match status required by MS-TDS instead of echoing the configured instance name.
+- Return the specified encryption values when required TLS receives `ENCRYPT_ON`, `ENCRYPT_REQ`, or `ENCRYPT_NOT_SUP`.
+
+### Changed
+
+- Record the PRELOGIN instance-match decision in telemetry for protocol-fidelity diagnostics.
+
 ## 0.1.3 - 2026-08-22
 
 ### Added

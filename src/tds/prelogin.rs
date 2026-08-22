@@ -114,15 +114,26 @@ pub fn parse(payload: &[u8]) -> Result<Prelogin> {
     Ok(result)
 }
 
-pub fn encode_response(encryption: Encryption, instance: &str) -> Vec<u8> {
+pub fn encode_request(encryption: Encryption, instance: &str) -> Vec<u8> {
+    let mut instance = instance.as_bytes().to_vec();
+    instance.push(0);
+    encode(encryption, instance)
+}
+
+/// Encode the server's PRELOGIN response.
+///
+/// MS-TDS defines the response INSTOPT value as a single status byte: zero
+/// when the requested instance is valid and one when it is not. It is not an
+/// echo of the configured instance name.
+pub fn encode_response(encryption: Encryption, instance_matches: bool) -> Vec<u8> {
+    encode(encryption, vec![u8::from(!instance_matches)])
+}
+
+fn encode(encryption: Encryption, instance: Vec<u8>) -> Vec<u8> {
     let values: [(u8, Vec<u8>); 5] = [
         (VERSION, vec![16, 0, 16, 89, 0, 0]),
         (ENCRYPTION, vec![encryption as u8]),
-        (INSTOPT, {
-            let mut v = instance.as_bytes().to_vec();
-            v.push(0);
-            v
-        }),
+        (INSTOPT, instance),
         (THREADID, vec![0, 0, 0, 0]),
         (MARS, vec![0]),
     ];
@@ -147,11 +158,37 @@ pub fn encode_response(encryption: Encryption, instance: &str) -> Vec<u8> {
 mod tests {
     use super::*;
     #[test]
-    fn response_round_trips() {
-        let raw = encode_response(Encryption::NotSupported, "MSSQLSERVER");
+    fn request_round_trips() {
+        let raw = encode_request(Encryption::NotSupported, "MSSQLSERVER");
         let parsed = parse(&raw).unwrap();
         assert_eq!(parsed.encryption, Some(Encryption::NotSupported));
         assert_eq!(parsed.instance.as_deref(), Some("MSSQLSERVER"));
+    }
+
+    #[test]
+    fn response_uses_one_byte_instance_status() {
+        let matched = encode_response(Encryption::On, true);
+        let mismatched = encode_response(Encryption::On, false);
+
+        assert_eq!(
+            matched,
+            [
+                0x00, 0x00, 0x1a, 0x00, 0x06, // VERSION descriptor
+                0x01, 0x00, 0x20, 0x00, 0x01, // ENCRYPTION descriptor
+                0x02, 0x00, 0x21, 0x00, 0x01, // INSTOPT descriptor
+                0x03, 0x00, 0x22, 0x00, 0x04, // THREADID descriptor
+                0x04, 0x00, 0x26, 0x00, 0x01, // MARS descriptor
+                0xff, // terminator
+                0x10, 0x00, 0x10, 0x59, 0x00, 0x00, // VERSION
+                0x01, // ENCRYPT_ON
+                0x00, // instance matches
+                0x00, 0x00, 0x00, 0x00, // THREADID
+                0x00, // MARS disabled
+            ]
+        );
+        assert_eq!(&mismatched[..33], &matched[..33]);
+        assert_eq!(mismatched[33], 1);
+        assert_eq!(&mismatched[34..], &matched[34..]);
     }
     #[test]
     fn arbitrary_data_never_panics() {
