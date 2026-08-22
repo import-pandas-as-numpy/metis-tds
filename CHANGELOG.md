@@ -4,6 +4,17 @@ All notable user-visible changes are documented here. The project follows [Seman
 
 ## Unreleased
 
+## 0.1.2 - 2026-08-22
+
+### Changed
+
+- Distinguish one-byte direct-login candidates from fully framed TDS LOGIN/LOGIN7 messages in telemetry and metrics.
+- Identify the specific LOGIN7 variable field and descriptor bounds responsible for parsing failures.
+
+### Security
+
+- Retain only the credential-free eight-byte TDS header for direct-login framing failures while continuing to exclude all login payload bytes from generic failure telemetry.
+
 ## 0.1.1 - 2026-08-22
 
 ### Security

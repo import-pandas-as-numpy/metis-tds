@@ -44,8 +44,8 @@ pub fn parse(payload: &[u8]) -> Result<LoginRequest> {
         return Err(Error::Protocol("LOGIN7 declared length is invalid".into()));
     }
     let option_flags_2 = payload[25];
-    let username = field(payload, 40, declared, false)?;
-    let password_raw = raw_field(payload, 44, declared)?;
+    let username = field(payload, 40, declared, false, "username")?;
+    let password_raw = raw_field(payload, 44, declared, "password")?;
     let password_present = !password_raw.is_empty();
     let password = if password_present {
         Some(deobfuscate_password(password_raw)?)
@@ -60,22 +60,27 @@ pub fn parse(payload: &[u8]) -> Result<LoginRequest> {
         option_flags_2,
         type_flags: payload[26],
         option_flags_3: payload[27],
-        client_hostname: field(payload, 36, declared, false)?,
+        client_hostname: field(payload, 36, declared, false, "client hostname")?,
         username,
         password,
         password_present,
-        application_name: field(payload, 48, declared, false)?,
-        server_name: field(payload, 52, declared, false)?,
-        client_library: field(payload, 60, declared, false)?,
-        language: field(payload, 64, declared, false)?,
-        database: field(payload, 68, declared, false)?,
+        application_name: field(payload, 48, declared, false, "application name")?,
+        server_name: field(payload, 52, declared, false, "server name")?,
+        client_library: field(payload, 60, declared, false, "client library")?,
+        language: field(payload, 64, declared, false, "language")?,
+        database: field(payload, 68, declared, false, "database")?,
         integrated_security: option_flags_2 & 0x80 != 0,
         sspi_bytes: sspi.len(),
         sspi_token_family: classify_sspi(sspi),
     })
 }
 
-fn raw_field(payload: &[u8], descriptor_offset: usize, declared: usize) -> Result<&[u8]> {
+fn raw_field<'a>(
+    payload: &'a [u8],
+    descriptor_offset: usize,
+    declared: usize,
+    name: &str,
+) -> Result<&'a [u8]> {
     let descriptor = payload
         .get(descriptor_offset..descriptor_offset + 4)
         .ok_or_else(|| Error::Protocol("LOGIN7 field descriptor truncated".into()))?;
@@ -93,7 +98,9 @@ fn raw_field(payload: &[u8], descriptor_offset: usize, declared: usize) -> Resul
         .checked_add(bytes)
         .ok_or_else(|| Error::Protocol("LOGIN7 field offset overflow".into()))?;
     if end > declared || offset < FIXED_LENGTH {
-        return Err(Error::Protocol("LOGIN7 field is outside message".into()));
+        return Err(Error::Protocol(format!(
+            "LOGIN7 {name} field is outside message (offset={offset}, bytes={bytes}, declared={declared})"
+        )));
     }
     Ok(&payload[offset..end])
 }
@@ -141,14 +148,17 @@ fn field(
     descriptor_offset: usize,
     declared: usize,
     allow_nul: bool,
+    name: &str,
 ) -> Result<String> {
-    let raw = raw_field(payload, descriptor_offset, declared)?;
-    decode_utf16(raw, allow_nul)
+    let raw = raw_field(payload, descriptor_offset, declared, name)?;
+    decode_utf16(raw, allow_nul, name)
 }
 
-fn decode_utf16(raw: &[u8], allow_nul: bool) -> Result<String> {
+fn decode_utf16(raw: &[u8], allow_nul: bool, name: &str) -> Result<String> {
     if raw.len() % 2 != 0 {
-        return Err(Error::Protocol("odd-length UTF-16 field".into()));
+        return Err(Error::Protocol(format!(
+            "LOGIN7 {name} field has odd-length UTF-16 data"
+        )));
     }
     let units = raw
         .chunks_exact(2)
@@ -157,7 +167,7 @@ fn decode_utf16(raw: &[u8], allow_nul: bool) -> Result<String> {
         .map(|item| item.unwrap_or(char::REPLACEMENT_CHARACTER))
         .collect();
     if !allow_nul && decoded.contains('\0') {
-        return Err(Error::Protocol("NUL in LOGIN7 text field".into()));
+        return Err(Error::Protocol(format!("LOGIN7 {name} field contains NUL")));
     }
     Ok(decoded)
 }
@@ -170,7 +180,7 @@ fn deobfuscate_password(raw: &[u8]) -> Result<String> {
             x.rotate_left(4)
         })
         .collect();
-    decode_utf16(&clear, false)
+    decode_utf16(&clear, false, "password")
 }
 
 fn le_u32(input: &[u8], offset: usize) -> Result<u32> {
@@ -208,6 +218,20 @@ mod tests {
         let login = parse(&payload).unwrap();
         assert!(login.username.is_empty());
         assert!(!login.password_present);
+    }
+
+    #[test]
+    fn identifies_the_invalid_variable_field_without_exposing_contents() {
+        let mut payload = vec![0_u8; 147];
+        payload[0..4].copy_from_slice(&147_u32.to_le_bytes());
+        payload[40..42].copy_from_slice(&146_u16.to_le_bytes());
+        payload[42..44].copy_from_slice(&2_u16.to_le_bytes());
+
+        let error = parse(&payload).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "TDS protocol error: LOGIN7 username field is outside message (offset=146, bytes=4, declared=147)"
+        );
     }
 
     #[test]
