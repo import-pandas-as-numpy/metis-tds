@@ -69,7 +69,28 @@ sudo systemctl status metis-tds
 
 Keep the configuration and TLS files read-only to the service. Only the log and payload directories should be writable. Do not mount a Docker socket, cloud credentials, package-manager credentials, domain credentials, or production files into the boundary.
 
-## Source build on an isolated VPS
+## Published container on an isolated VPS
+
+Public release images can be pulled from GHCR without placing GitHub credentials on the host. Pull the reviewed version, record its platform-specific image ID and repository digest, then promote the local image by ID so service restarts never follow a moving tag:
+
+```console
+sudo podman pull ghcr.io/import-pandas-as-numpy/metis-tds:<version>
+sudo podman image inspect ghcr.io/import-pandas-as-numpy/metis-tds:<version> \
+  --format 'image={{.Id}} digest={{index .RepoDigests 0}}'
+sudo podman tag <reviewed-image-id> localhost/metis-tds:candidate
+```
+
+Compare the digest with the published package, and verify its GitHub artifact attestation from a trusted administrative workstation:
+
+```console
+gh attestation verify \
+  oci://ghcr.io/import-pandas-as-numpy/metis-tds:<version> \
+  --repo import-pandas-as-numpy/metis-tds
+```
+
+Release manifests cover `linux/amd64` and `linux/arm64` and carry SPDX SBOM and SLSA provenance attestations. Keep `--pull=never` in the service unit after promotion. The runtime host needs no credential helper, personal access token, SSH deploy key, or authenticated registry configuration.
+
+## Source-build fallback on an isolated VPS
 
 A public checkout can be built on the VPS without placing GitHub or registry credentials on the host. Build an exact reviewed tag or commit rather than a moving branch:
 
@@ -94,7 +115,7 @@ sudo systemctl restart metis-tds
 sudo systemctl is-active metis-tds
 ```
 
-The checkout contains no authentication material and can be removed after the image is built. Do not configure a credential helper, personal access token, SSH deploy key, or authenticated registry on the honeypot host.
+The checkout contains no authentication material and can be removed after the image is built. Do not configure a credential helper, personal access token, SSH deploy key, or authenticated registry on the honeypot host. Prefer the published, attested container above when the host architecture is supported.
 
 Install `deploy/nftables-container.conf` as `/etc/nftables.conf`, `deploy/metis-tds-container.service` as `/etc/systemd/system/metis-tds.service`, and `deploy/metis-tds.logrotate` as `/etc/logrotate.d/metis-tds`. The nftables file owns the host ruleset; merge its table into the existing policy instead if the host already has local firewall rules. Mount the chosen configuration and freshly generated decoy TLS material under `/etc/metis-tds`; neither is baked into the image.
 
