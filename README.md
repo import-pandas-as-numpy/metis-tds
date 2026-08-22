@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/import-pandas-as-numpy/metis-tds/actions/workflows/ci.yml/badge.svg)](https://github.com/import-pandas-as-numpy/metis-tds/actions/workflows/ci.yml)
 [![zizmor](https://github.com/import-pandas-as-numpy/metis-tds/actions/workflows/zizmor.yml/badge.svg)](https://github.com/import-pandas-as-numpy/metis-tds/actions/workflows/zizmor.yml)
+[![fuzzing](https://github.com/import-pandas-as-numpy/metis-tds/actions/workflows/fuzz.yml/badge.svg)](https://github.com/import-pandas-as-numpy/metis-tds/actions/workflows/fuzz.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 Metis is a contained Microsoft SQL Server TDS 7.x/8.0 honeypot. It accepts real TDS connections, records login and request telemetry, classifies attacker intent, and returns synthetic SQL Server responses. It never executes submitted SQL, commands, assemblies, paths, or network destinations.
@@ -62,7 +63,7 @@ cargo deny check
 cargo deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check
 ```
 
-The test suite includes a standalone protocol client, independent Tiberius client flows for plaintext SQL batch/RPC and required TDS 7.x TLS, and a strict TDS 8.0 raw-TLS/PRELOGIN/LOGIN7 flow. `sqlcmd`, SSMS, FreeTDS, Impacket, Censys, and Shodan remain unclaimed until they have been exercised against a deployed instance; see the compatibility ledger.
+The test suite includes a standalone protocol client, independent Tiberius client flows for plaintext SQL batch/RPC and required TDS 7.x TLS, and a strict TDS 8.0 raw-TLS/PRELOGIN/LOGIN7 flow. `sqlcmd`, SSMS, FreeTDS, Impacket, Censys, and Shodan remain unclaimed until they have been exercised against a deployed instance.
 
 Coverage-guided fuzz targets are isolated from the production dependency graph under `fuzz/`. They require nightly Rust and `cargo-fuzz 0.13.2`:
 
@@ -82,7 +83,6 @@ The corpus directories are intentionally retained. On ptrace-restricted hosts wh
 - [Support](SUPPORT.md)
 - [Changelog](CHANGELOG.md)
 - [Secure deployment](docs/deployment.md)
-- [Public release checklist](docs/public-release-checklist.md)
 
 ## License
 

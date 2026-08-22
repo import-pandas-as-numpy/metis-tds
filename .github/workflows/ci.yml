@@ -2,6 +2,8 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 permissions: {}
@@ -21,7 +23,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
+      - run: rustup toolchain install 1.97.0 --profile minimal --component clippy,rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all --check
       - run: cargo test --all-targets --locked
@@ -90,6 +92,30 @@ jobs:
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
+          load: true
           push: false
           tags: metis-tds:ci
           build-args: VCS_REF=${{ github.sha }}
+      - name: Generate container SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: metis-tds:ci
+          format: spdx-json
+          output-file: metis-tds.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Upload container SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: metis-tds-sbom-${{ github.sha }}
+          path: metis-tds.spdx.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Scan container for fixable vulnerabilities
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: metis-tds:ci
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: true
+          output-format: table
