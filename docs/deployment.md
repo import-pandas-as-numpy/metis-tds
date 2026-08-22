@@ -17,6 +17,8 @@ Set `listener.address` to `0.0.0.0:1433`, move telemetry and payload paths under
 
 For credential research, `telemetry.capture_login_passwords` deliberately records parsed SQL-auth passwords in the JSONL sink and requires `telemetry.stdout=false`. `payloads.capture_login_messages` retains every fully framed attacker-supplied TDS 4.2 LOGIN or LOGIN7 message before parsing as a generated mode-`0600` artifact and requires payload capture to be enabled. The older `capture_login7` key remains an alias for existing configurations. Treat both directories as sensitive evidence: restrict access, set retention, and keep them out of container logs and routine log shipping. Generic parser-failure telemetry remains credential-blind.
 
+Set `personality.accept_source_after_attempts` to a positive integer to transition persistent password-spraying sources into the synthetic session after that many parsed SQL-auth attempts. The first `X` attempts follow normal credential policy; later attempts from the same IP are accepted and marked with `source_auth_bypass=true`. Use `null` to disable it. Counters are per-process and reset on restart; integrated authentication remains rejected.
+
 ## TLS
 
 TLS modes are:

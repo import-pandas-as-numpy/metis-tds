@@ -24,6 +24,8 @@ The example personality is entirely fictional and intentionally contains weak ho
 
 The research example enables `telemetry.capture_login_passwords` and `payloads.capture_login_messages`. Clear attempted passwords are written only to the mode-`0600` JSONL sink; validation forbids enabling that option while stdout telemetry is active. Every fully framed TDS 4.2 LOGIN or LOGIN7 message is stored before parsing as a mode-`0600` generated artifact, while ordinary failure events never include either login format's wire prefix. The older `payloads.capture_login7` key remains a backward-compatible alias.
 
+`personality.accept_source_after_attempts` optionally admits a source after a configurable number of parsed SQL-auth attempts regardless of the submitted username/password. A value of `X` applies normal authentication to attempts 1 through `X`, then accepts attempt `X+1` and later from that IP. `null` disables the behavior. Counters are in-memory, reset on restart, and do not count or bypass integrated authentication.
+
 TLS certificate conversion, systemd hardening, outbound-deny guidance, and Internet-indexing caveats are in `docs/deployment.md`.
 
 ## Container

@@ -55,6 +55,11 @@ impl Config {
                 "personality.databases may not be empty".into(),
             ));
         }
+        if self.personality.accept_source_after_attempts == Some(0) {
+            return Err(Error::Config(
+                "personality.accept_source_after_attempts must be greater than zero".into(),
+            ));
+        }
         if self.telemetry.capture_login_passwords
             && (self.telemetry.stdout || self.telemetry.jsonl_path.is_none())
         {

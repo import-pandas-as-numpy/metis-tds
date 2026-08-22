@@ -553,9 +553,22 @@ where
         .metrics
         .login_attempts
         .fetch_add(1, Ordering::Relaxed);
+    let source_login_attempt =
+        (!login.integrated_security).then(|| shared.record_login_attempt(peer.ip()));
     progress.enter("authentication");
+    let bypass_threshold = shared.config.personality.accept_source_after_attempts;
+    let source_auth_bypass = matches!(
+        (bypass_threshold, source_login_attempt),
+        (Some(threshold), Some(attempt)) if attempt > threshold
+    );
     let decision = if login.integrated_security {
         AuthDecision::Reject
+    } else if source_auth_bypass {
+        shared
+            .metrics
+            .source_auth_bypasses
+            .fetch_add(1, Ordering::Relaxed);
+        AuthDecision::Accept
     } else {
         shared.config.personality.authenticate(&login)
     };
@@ -588,6 +601,9 @@ where
         .field("sspi_bytes", login.sspi_bytes)
         .field("sspi_token_family", login.sspi_token_family)
         .field("accepted", accepted)
+        .field("source_login_attempt_number", source_login_attempt)
+        .field("source_auth_bypass_threshold", bypass_threshold)
+        .field("source_auth_bypass", source_auth_bypass)
         .field(
             "honey_identity",
             shared.config.personality.is_honey_login(&login.username),

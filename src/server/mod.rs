@@ -39,6 +39,7 @@ pub(crate) struct Shared {
     connection_limit: Arc<Semaphore>,
     per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
     request_rates: Mutex<HashMap<IpAddr, RateWindow>>,
+    login_attempts_by_ip: Mutex<HashMap<IpAddr, u64>>,
 }
 
 #[derive(Default)]
@@ -49,6 +50,7 @@ pub(crate) struct Metrics {
     pub direct_login_connections: AtomicU64,
     pub login_attempts: AtomicU64,
     pub accepted_logins: AtomicU64,
+    pub source_auth_bypasses: AtomicU64,
     pub malformed_messages: AtomicU64,
     pub sql_batches: AtomicU64,
     pub rpc_requests: AtomicU64,
@@ -92,6 +94,7 @@ impl Server {
                 connection_limit: Arc::new(Semaphore::new(max_connections)),
                 per_ip: Arc::new(Mutex::new(HashMap::new())),
                 request_rates: Mutex::new(HashMap::new()),
+                login_attempts_by_ip: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -351,6 +354,10 @@ async fn connection_task(
                 shared.metrics.accepted_logins.load(Ordering::Relaxed),
             )
             .field(
+                "source_auth_bypasses",
+                shared.metrics.source_auth_bypasses.load(Ordering::Relaxed),
+            )
+            .field(
                 "malformed_tds_messages",
                 shared.metrics.malformed_messages.load(Ordering::Relaxed),
             )
@@ -419,6 +426,16 @@ fn diagnostic_prefix_is_safe(stage: &str, prefix: &[u8]) -> bool {
 }
 
 impl Shared {
+    pub fn record_login_attempt(&self, ip: IpAddr) -> u64 {
+        let mut attempts = self
+            .login_attempts_by_ip
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = attempts.entry(ip).or_default();
+        *count = count.saturating_add(1);
+        *count
+    }
+
     pub fn allow_request(&self, ip: IpAddr) -> bool {
         let mut rates = self
             .request_rates

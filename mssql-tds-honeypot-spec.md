@@ -304,6 +304,9 @@ Supported modes:
 3. Accept a limited class of usernames with synthetic passwords.
 4. Simulate disabled or locked-out accounts.
 5. Simulate SQL authentication or integrated-authentication limitations.
+6. Optionally admit an IP after a configured number of parsed SQL-auth attempts,
+   independent of username/password, to draw persistent spraying sources into
+   the synthetic session. Integrated authentication is never bypassed.
 
 The system does not need to validate real Active Directory credentials.
 
@@ -1145,6 +1148,9 @@ payloads:
   enabled: true
   directory: "/var/lib/tdshoney/payloads"
   capture_login_messages: true
+
+personality:
+  accept_source_after_attempts: null
 ```
 
 ---

@@ -323,6 +323,68 @@ async fn malformed_legacy_login_is_archived_but_not_copied_to_failure_diagnostic
 }
 
 #[tokio::test]
+async fn source_is_admitted_only_after_configured_number_of_sql_auth_attempts() {
+    let temp = tempfile::tempdir().unwrap();
+    let telemetry_path = temp.path().join("events.jsonl");
+    let mut config = Config::default();
+    config.listener.address = "127.0.0.1:0".into();
+    config.telemetry.jsonl_path = Some(telemetry_path.to_string_lossy().into_owned());
+    config.telemetry.stdout = false;
+    config.personality.accept_unknown_logins = false;
+    config.personality.accept_source_after_attempts = Some(2);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(Server::new(config).await.unwrap().serve(listener, false));
+
+    for (attempt, should_accept) in [(1, false), (2, false), (3, true)] {
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let payload = legacy_login(
+            "scanner",
+            "unknown_user",
+            &format!("wrong-{attempt}"),
+            "pymssql",
+        );
+        write_message(&mut client, tds::LOGIN, &payload, 4096)
+            .await
+            .unwrap();
+        let response = read_message(&mut client, 4096, 65_536).await.unwrap();
+        assert_eq!(response.payload.contains(&0xad), should_accept);
+    }
+
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        events = std::fs::read_to_string(&telemetry_path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect();
+        if events
+            .iter()
+            .filter(|event| event["event_type"] == "login_attempt")
+            .count()
+            == 3
+        {
+            break;
+        }
+    }
+    let attempts: Vec<_> = events
+        .iter()
+        .filter(|event| event["event_type"] == "login_attempt")
+        .collect();
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(attempts[0]["source_login_attempt_number"], 1);
+    assert_eq!(attempts[0]["source_auth_bypass"], false);
+    assert_eq!(attempts[1]["source_login_attempt_number"], 2);
+    assert_eq!(attempts[1]["source_auth_bypass"], false);
+    assert_eq!(attempts[2]["source_login_attempt_number"], 3);
+    assert_eq!(attempts[2]["source_auth_bypass_threshold"], 2);
+    assert_eq!(attempts[2]["source_auth_bypass"], true);
+    assert_eq!(attempts[2]["accepted"], true);
+    task.abort();
+}
+
+#[tokio::test]
 async fn direct_ntlm_login_is_classified_without_putting_token_in_events() {
     let temp = tempfile::tempdir().unwrap();
     let telemetry_path = temp.path().join("events.jsonl");

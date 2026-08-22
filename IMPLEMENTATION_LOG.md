@@ -44,6 +44,7 @@ The user explicitly approved cargo-fuzz on 2026-08-17. Socket MCP scored `cargo-
 - [x] Bounded SHA-256 payload capture using generated mode-0600 non-executable files
 - [x] Bounded asynchronous JSONL/stdout telemetry with dropped-event count
 - [x] Connection/PRELOGIN/TLS/login/request/state/honey/payload/close/metrics events
+- [x] Optional per-source post-threshold SQL-auth admission with attempt/bypass telemetry
 - [x] Stage-local failure byte counts, safe TDS header metadata, and bounded credential-aware diagnostic prefixes
 - [x] Opt-in parsed-password telemetry and pre-parse bounded mode-0600 LOGIN/LOGIN7 artifact capture, separated from generic parser diagnostics
 

@@ -16,6 +16,7 @@ pub struct Personality {
     pub default_database: String,
     pub language: String,
     pub accept_unknown_logins: bool,
+    pub accept_source_after_attempts: Option<u64>,
     pub unknown_query_behavior: UnknownQueryBehavior,
     pub databases: Vec<String>,
     pub logins: Vec<LoginDefinition>,
@@ -37,6 +38,7 @@ impl Default for Personality {
             default_database: "master".into(),
             language: "us_english".into(),
             accept_unknown_logins: true,
+            accept_source_after_attempts: None,
             unknown_query_behavior: UnknownQueryBehavior::Empty,
             databases: vec![
                 "master".into(),

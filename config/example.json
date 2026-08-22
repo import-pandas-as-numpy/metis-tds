@@ -44,6 +44,7 @@
     "default_database": "ERP_Production",
     "language": "us_english",
     "accept_unknown_logins": false,
+    "accept_source_after_attempts": null,
     "unknown_query_behavior": "empty",
     "databases": [
       "master",
