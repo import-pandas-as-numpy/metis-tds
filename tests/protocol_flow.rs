@@ -244,7 +244,7 @@ async fn legacy_direct_login_captures_password_and_enters_authentication() {
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(Server::new(config).await.unwrap().serve(listener, false));
 
-    let payload = legacy_login("143.244.215.213:1433", "sa", "gold", "pymssql");
+    let payload = legacy_login("203.0.113.10:1433", "sa", "gold", "pymssql");
     let mut client = TcpStream::connect(address).await.unwrap();
     write_message(&mut client, tds::LOGIN, &payload, 4096)
         .await
@@ -533,7 +533,7 @@ fn legacy_login(host: &str, username: &str, password: &str, application: &str) -
     put_legacy_field(&mut payload, 62, 92, password);
     payload[123] = 4;
     put_legacy_field(&mut payload, 140, 170, application);
-    put_legacy_field(&mut payload, 171, 201, "143.244.215.213:1433");
+    put_legacy_field(&mut payload, 171, 201, "203.0.113.10:1433");
     payload[458..462].copy_from_slice(&0x0402_0000_u32.to_be_bytes());
     put_legacy_field(&mut payload, 462, 472, "pymssql");
     put_legacy_field(&mut payload, 480, 510, "us_english");

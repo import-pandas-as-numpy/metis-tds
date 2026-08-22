@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/import-pandas-as-numpy/metis-tds/security/advisories/new
+    about: Report vulnerabilities privately; do not disclose them in an issue.
+  - name: Deployment guidance
+    url: https://github.com/import-pandas-as-numpy/metis-tds/blob/main/docs/deployment.md
+    about: Review containment and deployment requirements before opening an operational question.

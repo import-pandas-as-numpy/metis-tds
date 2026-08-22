@@ -1,6 +1,10 @@
 # Rust build output
 /target/
 /fuzz/target/
+/coverage/
+/dist/
+*.profraw
+lcov.info
 
 # Runtime data
 *.jsonl
@@ -12,6 +16,7 @@
 .env
 .env.*
 !.env.example
+.direnv/
 *.crt
 *.der
 *.key
@@ -23,5 +28,7 @@
 .DS_Store
 .idea/
 .vscode/
+.fleet/
 *.swp
 *~
+Thumbs.db

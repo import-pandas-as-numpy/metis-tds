@@ -5,6 +5,11 @@ edition = "2024"
 rust-version = "1.85"
 description = "Contained, stateful Microsoft SQL Server TDS honeypot"
 license = "Apache-2.0"
+repository = "https://github.com/import-pandas-as-numpy/metis-tds"
+readme = "README.md"
+keywords = ["honeypot", "mssql", "security", "tds"]
+categories = ["command-line-utilities", "network-programming"]
+publish = false
 
 [lib]
 name = "metis_tds"
