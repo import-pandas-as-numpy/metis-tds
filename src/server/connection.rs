@@ -272,7 +272,12 @@ pub async fn handle(
             .await
             .map_err(|error| progress.failure(error));
     }
-    if first[0] == tds::LOGIN7 {
+    if matches!(first[0], tds::LOGIN | tds::LOGIN7) {
+        let transport = if first[0] == tds::LOGIN {
+            "tds42_direct"
+        } else {
+            "tds7_direct"
+        };
         shared
             .metrics
             .direct_login_connections
@@ -281,7 +286,8 @@ pub async fn handle(
             Event::new("direct_login_detected", Some(connection_id), None)
                 .field("source_ip", peer.ip().to_string())
                 .field("source_port", peer.port())
-                .field("transport", "tds7_direct"),
+                .field("transport", transport)
+                .field("packet_type", first[0]),
         );
         return login_and_serve(
             shared,
@@ -289,7 +295,7 @@ pub async fn handle(
             peer,
             connection_id,
             &mut progress,
-            "tds7_direct",
+            transport,
         )
         .await
         .map_err(|error| progress.failure(error));
@@ -523,22 +529,46 @@ where
         ),
     )
     .await
-    .map_err(|_| Error::Protocol("LOGIN7 timeout".into()))??;
+    .map_err(|_| Error::Protocol("login message timeout".into()))??;
     progress.observe_message(&login_message);
-    progress.enter("login_parse");
-    if login_message.packet_type != tds::LOGIN7 {
-        return Err(Error::Protocol("expected LOGIN7 message".into()));
+    let legacy_login = login_message.packet_type == tds::LOGIN;
+    let transport = match (transport, login_message.packet_type) {
+        ("tds7", tds::LOGIN) => "tds42_after_prelogin",
+        ("tds8", tds::LOGIN) => "tds42_over_tds8",
+        (value, _) => value,
+    };
+    if matches!(login_message.packet_type, tds::LOGIN | tds::LOGIN7) {
+        progress.enter("login_capture");
+        capture_login_message(&shared, peer, connection_id, &login_message, transport).await;
     }
-    let mut login = tds::login7::parse(&login_message.payload)?;
+    progress.enter("login_parse");
+    let mut login = match login_message.packet_type {
+        tds::LOGIN => tds::login::parse(&login_message.payload)?,
+        tds::LOGIN7 => tds::login7::parse(&login_message.payload)?,
+        _ => return Err(Error::Protocol("expected LOGIN or LOGIN7 message".into())),
+    };
     let session_id = shared.sessions.fetch_add(1, Ordering::Relaxed);
     progress.session_id = Some(session_id);
     shared
         .metrics
         .login_attempts
         .fetch_add(1, Ordering::Relaxed);
+    let source_login_attempt =
+        (!login.integrated_security).then(|| shared.record_login_attempt(peer.ip()));
     progress.enter("authentication");
+    let bypass_threshold = shared.config.personality.accept_source_after_attempts;
+    let source_auth_bypass = matches!(
+        (bypass_threshold, source_login_attempt),
+        (Some(threshold), Some(attempt)) if attempt > threshold
+    );
     let decision = if login.integrated_security {
         AuthDecision::Reject
+    } else if source_auth_bypass {
+        shared
+            .metrics
+            .source_auth_bypasses
+            .fetch_add(1, Ordering::Relaxed);
+        AuthDecision::Accept
     } else {
         shared.config.personality.authenticate(&login)
     };
@@ -546,6 +576,15 @@ where
     let mut login_event = Event::new("login_attempt", Some(connection_id), Some(session_id))
         .field("source_ip", peer.ip().to_string())
         .field("transport", transport)
+        .field(
+            "login_format",
+            if legacy_login {
+                "tds42_login"
+            } else {
+                "login7"
+            },
+        )
+        .field("packet_type", login_message.packet_type)
         .field("packet_count", login_message.packet_count)
         .field("first_packet_status", login_message.first_status)
         .field("first_packet_id", login_message.first_packet_id)
@@ -562,6 +601,9 @@ where
         .field("sspi_bytes", login.sspi_bytes)
         .field("sspi_token_family", login.sspi_token_family)
         .field("accepted", accepted)
+        .field("source_login_attempt_number", source_login_attempt)
+        .field("source_auth_bypass_threshold", bypass_threshold)
+        .field("source_auth_bypass", source_auth_bypass)
         .field(
             "honey_identity",
             shared.config.personality.is_honey_login(&login.username),
@@ -571,28 +613,6 @@ where
     }
     shared.telemetry.emit(login_event);
 
-    if shared.config.payloads.capture_login7 {
-        match shared.payloads.capture(&login_message.payload).await {
-            Ok(Some(captured)) => shared.telemetry.emit(
-                Event::new("login7_capture", Some(connection_id), Some(session_id))
-                    .field("source_ip", peer.ip().to_string())
-                    .field("transport", transport)
-                    .field("sha256", captured.sha256)
-                    .field("size", captured.size)
-                    .field("storage_id", captured.storage_id),
-            ),
-            Ok(None) => {}
-            Err(error) => shared.telemetry.emit(
-                Event::new(
-                    "login7_capture_error",
-                    Some(connection_id),
-                    Some(session_id),
-                )
-                .field("source_ip", peer.ip().to_string())
-                .field("error", error.to_string()),
-            ),
-        }
-    }
     login.discard_password();
     if !accepted {
         progress.enter("login_response");
@@ -684,8 +704,14 @@ where
             tds::SQL_BATCH => {
                 progress.enter("sql_batch_parse");
                 shared.metrics.sql_batches.fetch_add(1, Ordering::Relaxed);
-                let sql =
-                    tds::batch::decode(&message.payload, shared.config.limits.max_sql_batch_bytes)?;
+                let sql = if legacy_login {
+                    tds::batch::decode_legacy(
+                        &message.payload,
+                        shared.config.limits.max_sql_batch_bytes,
+                    )?
+                } else {
+                    tds::batch::decode(&message.payload, shared.config.limits.max_sql_batch_bytes)?
+                };
                 let outcome = handle_sql(&mut session, &shared.config.personality, &sql);
                 emit_request(
                     &shared,
@@ -766,6 +792,44 @@ where
         )?;
         progress.enter("response_write");
         write_message(&mut stream, tds::TABULAR_RESULT, &response, packet_size).await?;
+    }
+}
+
+async fn capture_login_message(
+    shared: &Shared,
+    peer: SocketAddr,
+    connection_id: Uuid,
+    message: &tds::packet::Message,
+    transport: &str,
+) {
+    if !shared.config.payloads.captures_login_messages() {
+        return;
+    }
+    match shared.payloads.capture(&message.payload).await {
+        Ok(Some(captured)) => shared.telemetry.emit(
+            Event::new("login_message_capture", Some(connection_id), None)
+                .field("source_ip", peer.ip().to_string())
+                .field("transport", transport)
+                .field("packet_type", message.packet_type)
+                .field(
+                    "login_format",
+                    if message.packet_type == tds::LOGIN {
+                        "tds42_login"
+                    } else {
+                        "login7"
+                    },
+                )
+                .field("sha256", captured.sha256)
+                .field("size", captured.size)
+                .field("storage_id", captured.storage_id),
+        ),
+        Ok(None) => {}
+        Err(error) => shared.telemetry.emit(
+            Event::new("login_message_capture_error", Some(connection_id), None)
+                .field("source_ip", peer.ip().to_string())
+                .field("packet_type", message.packet_type)
+                .field("error", error.to_string()),
+        ),
     }
 }
 

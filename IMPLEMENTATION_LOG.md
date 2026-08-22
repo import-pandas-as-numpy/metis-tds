@@ -2,7 +2,7 @@
 
 This is the restart-safe source of truth for the project. Update it whenever a feature is implemented, verified, deferred, or found incompatible. A checked box means code and an automated check exist; client compatibility is only claimed when the named client has been exercised.
 
-Last updated: 2026-08-21
+Last updated: 2026-08-22
 
 ## Current phase
 
@@ -28,7 +28,7 @@ The user explicitly approved cargo-fuzz on 2026-08-17. Socket MCP scored `cargo-
 - [x] PRELOGIN parse/response (VERSION, ENCRYPTION, INSTOPT, THREADID, MARS)
 - [x] TDS-encapsulated TLS handshake and encrypted session (TLS 1.3 independently verified; rustls TLS 1.2 enabled)
 - [x] TDS 8.0 raw TLS-before-PRELOGIN with `tds/8.0` ALPN and encrypted LOGIN7
-- [x] PRELOGIN-following and legacy direct LOGIN7 handling, safe field extraction, NTLM/SPNEGO classification, transient password discard, and SQL-auth decisions
+- [x] TDS 4.2 LOGIN plus PRELOGIN-following/direct LOGIN7 handling, safe field extraction, NTLM/SPNEGO classification, transient password discard, and SQL-auth decisions
 - [x] LOGINACK / ENVCHANGE / INFO / ERROR / DONE encoding
 - [x] SQL_BATCH UTF-16 decoding and result sets
 - [x] RPC decoding for common procedure names/IDs and scalar string/binary/integer/bit parameters
@@ -44,8 +44,9 @@ The user explicitly approved cargo-fuzz on 2026-08-17. Socket MCP scored `cargo-
 - [x] Bounded SHA-256 payload capture using generated mode-0600 non-executable files
 - [x] Bounded asynchronous JSONL/stdout telemetry with dropped-event count
 - [x] Connection/PRELOGIN/TLS/login/request/state/honey/payload/close/metrics events
-- [x] Stage-local failure byte counts, safe TDS header metadata, and bounded pre-LOGIN7 wire prefixes
-- [x] Opt-in parsed-password telemetry and bounded mode-0600 LOGIN7 artifact capture, separated from generic parser diagnostics
+- [x] Optional per-source post-threshold SQL-auth admission with attempt/bypass telemetry
+- [x] Stage-local failure byte counts, safe TDS header metadata, and bounded credential-aware diagnostic prefixes
+- [x] Opt-in parsed-password telemetry and pre-parse bounded mode-0600 LOGIN/LOGIN7 artifact capture, separated from generic parser diagnostics
 
 ### Hardening
 
@@ -63,7 +64,7 @@ Blank means untested, not unsupported.
 
 | Client / scanner | PRELOGIN | TLS | LOGIN7 | SQL_BATCH | RPC | Evidence |
 |---|---:|---:|---:|---:|---:|---|
-| Built-in protocol test client | pass/direct bypass | not exercised | pass (SQL auth + direct NTLM classification) | pass | n/a | `tests/protocol_flow.rs` |
+| Built-in protocol test client | pass/direct bypass | not exercised | pass (TDS 4.2 SQL auth, LOGIN7 SQL auth + direct NTLM classification) | pass | n/a | `tests/protocol_flow.rs` |
 | Tiberius 0.12.3 | pass | pass (required/TLS 1.3) | pass | pass | pass (`sp_executesql`) | `tests/tiberius_compat.rs`, `tests/tls_compat.rs` |
 | Built-in strict TDS 8.0 client | pass (inside raw TLS) | pass (TLS first, `tds/8.0` ALPN) | pass | not exercised | not exercised | `tests/tls_compat.rs` |
 | sqlcmd |  |  |  |  |  | |
@@ -87,6 +88,7 @@ Blank means untested, not unsupported.
 ## Known limits / next evidence needed
 
 - SQL authentication over TDS 7.4 and the TDS 8.0 strict-encryption entry path are compatibility targets. Integrated SSPI authentication completion, FedAuth, MARS, TVP/encrypted RPC parameters, and arbitrary T-SQL semantics are intentionally unsupported; direct and PRELOGIN-following integrated LOGIN7 attempts are identified, safely classified, optionally archived, and rejected.
+- TDS 4.2 LOGIN authentication and single-byte SQL batch capture are implemented from MS-SSTDS. Full TDS 4.2 result-set encoding remains a compatibility limit; independent `pymssql` session verification is still needed.
 - `sqlcmd`, FreeTDS, Impacket, and SSMS are not installed in this environment and remain unclaimed.
 - Shodan/Censys identification requires deploying the service on a public address and observing the external classifier; local PRELOGIN conformance is necessary but not proof of indexing.
 - Coverage-guided fuzzing is approved and scaffolded. See verification evidence for the most recent bounded campaign result.

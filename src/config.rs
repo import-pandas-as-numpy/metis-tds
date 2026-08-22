@@ -55,6 +55,11 @@ impl Config {
                 "personality.databases may not be empty".into(),
             ));
         }
+        if self.personality.accept_source_after_attempts == Some(0) {
+            return Err(Error::Config(
+                "personality.accept_source_after_attempts must be greater than zero".into(),
+            ));
+        }
         if self.telemetry.capture_login_passwords
             && (self.telemetry.stdout || self.telemetry.jsonl_path.is_none())
         {
@@ -63,9 +68,11 @@ impl Config {
                     .into(),
             ));
         }
-        if self.payloads.capture_login7 && !self.payloads.enabled {
+        if (self.payloads.capture_login_messages || self.payloads.capture_login7)
+            && !self.payloads.enabled
+        {
             return Err(Error::Config(
-                "payloads.capture_login7 requires payloads.enabled=true".into(),
+                "login-message capture requires payloads.enabled=true".into(),
             ));
         }
         Ok(())
@@ -186,6 +193,8 @@ impl Default for TelemetryConfig {
 pub struct PayloadConfig {
     pub enabled: bool,
     pub directory: String,
+    pub capture_login_messages: bool,
+    // Backward-compatible alias retained for existing deployment files.
     pub capture_login7: bool,
 }
 
@@ -194,8 +203,15 @@ impl Default for PayloadConfig {
         Self {
             enabled: false,
             directory: "payloads".into(),
+            capture_login_messages: false,
             capture_login7: false,
         }
+    }
+}
+
+impl PayloadConfig {
+    pub fn captures_login_messages(&self) -> bool {
+        self.capture_login_messages || self.capture_login7
     }
 }
 
