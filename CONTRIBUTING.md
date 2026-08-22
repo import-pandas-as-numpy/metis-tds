@@ -41,7 +41,7 @@ CI also checks the declared Rust 1.85 minimum supported version and builds the p
 
 - Keep each pull request focused and explain the security or protocol tradeoffs it introduces.
 - Add regression tests for parser, state-machine, or semantic changes.
-- Update `README.md`, `docs/`, the protocol specification, or `IMPLEMENTATION_LOG.md` when behavior or compatibility claims change.
+- Update `README.md`, `docs/`, and `CHANGELOG.md` when behavior or compatibility claims change.
 - Preserve bounded reads, timeouts, generated storage names, and the no-execution/no-outbound safety boundary.
 - Do not weaken containment defaults merely to make a compatibility test pass.
 - Add an entry under `Unreleased` in `CHANGELOG.md` for user-visible changes.

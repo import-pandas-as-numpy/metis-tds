@@ -2,14 +2,12 @@
 
 [![CI](https://github.com/import-pandas-as-numpy/metis-tds/actions/workflows/ci.yml/badge.svg)](https://github.com/import-pandas-as-numpy/metis-tds/actions/workflows/ci.yml)
 [![zizmor](https://github.com/import-pandas-as-numpy/metis-tds/actions/workflows/zizmor.yml/badge.svg)](https://github.com/import-pandas-as-numpy/metis-tds/actions/workflows/zizmor.yml)
-[![License](https://img.shields.io/github/license/import-pandas-as-numpy/metis-tds)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 Metis is a contained Microsoft SQL Server TDS 7.x/8.0 honeypot. It accepts real TDS connections, records login and request telemetry, classifies attacker intent, and returns synthetic SQL Server responses. It never executes submitted SQL, commands, assemblies, paths, or network destinations.
 
 > [!CAUTION]
 > Metis receives untrusted network traffic and can deliberately record attacker-supplied credentials. Deploy it only on infrastructure you own or are authorized to operate, inside the containment boundary described below. It is pre-1.0 research software, not a database server or a security boundary by itself.
-
-The detailed requirements are in [the protocol specification](mssql-tds-honeypot-spec.md); verified progress and compatibility evidence are in [the implementation log](IMPLEMENTATION_LOG.md).
 
 Protocol behavior is implemented from Microsoft's current MS-TDS and MS-SSTDS open specifications. The project supports bounded multi-packet framing, TDS 4.2 LOGIN (`0x02`), PRELOGIN and direct LOGIN7, TDS 7.x-wrapped TLS 1.2/1.3, TDS 8.0 TLS-before-PRELOGIN with `tds/8.0` ALPN, SQL batches, common RPC parameters, stateful attacker-oriented semantics, synthetic result sets, JSONL telemetry, and bounded payload capture.
 
