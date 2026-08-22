@@ -4,6 +4,16 @@ All notable user-visible changes are documented here. The project follows [Seman
 
 ## Unreleased
 
+## 0.1.3 - 2026-08-22
+
+### Added
+
+- Publish public multi-architecture release images to GitHub Container Registry with an SPDX SBOM, SLSA provenance, and a GitHub artifact attestation.
+
+### Changed
+
+- Document anonymous, digest-pinned GHCR deployment as the preferred container deployment path while retaining the public source-build procedure as a fallback.
+
 ## 0.1.2 - 2026-08-22
 
 ### Changed
