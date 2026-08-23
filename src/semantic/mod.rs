@@ -103,29 +103,38 @@ pub fn handle_rpc(
     personality: &Personality,
     rpc: &RpcRequest,
 ) -> Outcome {
-    if rpc.procedure.eq_ignore_ascii_case("sp_executesql") {
-        if let Some(sql) = rpc.parameters.first().and_then(|p| p.value.as_text()) {
-            let mut expanded = sql.to_owned();
-            for parameter in rpc.parameters.iter().skip(2) {
-                if !parameter.name.is_empty() {
-                    expanded = expanded.replace(&parameter.name, &parameter.value.to_sql_literal());
+    let statements = rpc
+        .batches
+        .iter()
+        .filter(|batch| !batch.no_execute)
+        .map(|batch| {
+            if batch.procedure.eq_ignore_ascii_case("sp_executesql") {
+                if let Some(sql) = batch.parameters.first().and_then(|p| p.value.as_text()) {
+                    let mut expanded = sql.to_owned();
+                    for parameter in batch.parameters.iter().skip(2) {
+                        if !parameter.name.is_empty() {
+                            expanded = expanded
+                                .replace(&parameter.name, &parameter.value.to_sql_literal());
+                        }
+                    }
+                    return expanded;
                 }
             }
-            return handle_sql(session, personality, &expanded);
-        }
-    }
-    let arguments = rpc
-        .parameters
-        .iter()
-        .map(|p| p.value.to_sql_literal())
+            let arguments = batch
+                .parameters
+                .iter()
+                .map(|p| p.value.to_sql_literal())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if arguments.is_empty() {
+                format!("EXEC {}", batch.procedure)
+            } else {
+                format!("EXEC {} {arguments}", batch.procedure)
+            }
+        })
         .collect::<Vec<_>>()
-        .join(", ");
-    let synthetic = if arguments.is_empty() {
-        format!("EXEC {}", rpc.procedure)
-    } else {
-        format!("EXEC {} {arguments}", rpc.procedure)
-    };
-    handle_sql(session, personality, &synthetic)
+        .join("; ");
+    handle_sql(session, personality, &statements)
 }
 
 pub fn handle_sql(session: &mut SessionState, personality: &Personality, sql: &str) -> Outcome {

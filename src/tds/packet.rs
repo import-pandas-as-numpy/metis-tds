@@ -93,6 +93,25 @@ pub async fn read_message<R: AsyncRead + Unpin>(
     loop {
         let mut raw = [0_u8; HEADER_LEN];
         reader.read_exact(&mut raw).await?;
+        if raw[0] == 0x53 {
+            // SMP/MARS is not negotiated by this server, but consume the
+            // complete first frame so the lossless ingress capture contains a
+            // useful artifact rather than only half of its 16-byte header.
+            let length = usize::try_from(u32::from_le_bytes(
+                raw[4..8].try_into().expect("length checked"),
+            ))
+            .map_err(|_| Error::Limit("SMP frame"))?;
+            if !(crate::tds::smp::HEADER_LEN..=max_message).contains(&length) {
+                return Err(Error::Protocol(format!(
+                    "invalid SMP frame length {length}"
+                )));
+            }
+            let mut rest = vec![0u8; length - HEADER_LEN];
+            reader.read_exact(&mut rest).await?;
+            return Err(Error::Protocol(
+                "SMP/MARS frame received without MARS negotiation".into(),
+            ));
+        }
         let header = Header::decode(raw, max_packet)?;
         // PacketID is advisory and explicitly ignored by receivers in MS-TDS.
         // Real clients normally increment it, but interoperability must not

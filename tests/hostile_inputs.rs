@@ -1,4 +1,7 @@
-use metis_tds::tds::{batch, login7, packet::Header, prelogin, rpc};
+use metis_tds::tds::{
+    all_headers, batch, bulk, fedauth, login, login7, packet::Header, prelogin, rpc, smp, sspi,
+    tds5, transaction,
+};
 
 #[test]
 fn deterministic_parser_fuzz_smoke_has_no_panics() {
@@ -10,8 +13,21 @@ fn deterministic_parser_fuzz_smoke_has_no_panics() {
             *byte = next(&mut state) as u8;
         }
         let _ = prelogin::parse(&input);
+        let _ = prelogin::parse_for_telemetry(&input);
+        let _ = login::parse_for_telemetry(&input);
         let _ = login7::parse(&input);
+        let _ = login7::parse_for_telemetry(&input);
+        let _ = login7::sspi_token(&input);
+        let _ = fedauth::parse(&input, false);
+        let _ = fedauth::parse(&input, true);
+        let _ = sspi::parse(&input);
+        let _ = all_headers::parse(&input);
+        let _ = transaction::parse(&input);
         let _ = rpc::parse(&input, 4096);
+        let _ = bulk::parse(&input, 4096, false, 2);
+        let _ = bulk::parse(&input, 4096, true, 2);
+        let _ = smp::parse(&input, 4096);
+        let _ = tds5::parse_authentication(&input, 4096);
         let _ = batch::decode(&input, 4096);
         if input.len() >= 8 {
             let mut raw = [0_u8; 8];

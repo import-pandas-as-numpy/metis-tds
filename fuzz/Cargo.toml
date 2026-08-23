@@ -40,5 +40,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ingress"
+path = "fuzz_targets/ingress.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

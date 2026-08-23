@@ -29,7 +29,7 @@ jobs:
       - run: cargo +nightly fuzz build
       - name: Exercise retained corpora
         run: |
-          for target in packet prelogin login7 tokens; do
+          for target in packet prelogin login7 ingress tokens; do
             cargo +nightly fuzz run "$target" -- -runs=10000 -max_len=65536 -timeout=5
           done
       - name: Upload crashing inputs

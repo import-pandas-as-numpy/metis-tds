@@ -56,9 +56,14 @@ async fn plaintext_login_and_discovery_query_complete() {
         .encode_utf16()
         .flat_map(u16::to_le_bytes)
         .collect();
-    write_message(&mut client, tds::SQL_BATCH, &sql, 4096)
-        .await
-        .unwrap();
+    write_message(
+        &mut client,
+        tds::SQL_BATCH,
+        &with_transaction_header(&sql),
+        4096,
+    )
+    .await
+    .unwrap();
     let result = read_message(&mut client, 4096, 65_536).await.unwrap();
     assert!(result.payload.contains(&0x81));
     assert!(contains_utf16(&result.payload, "Microsoft SQL Server"));
@@ -427,6 +432,16 @@ async fn direct_ntlm_login_is_classified_without_putting_token_in_events() {
     write_message(&mut client, tds::LOGIN7, &payload, 4096)
         .await
         .unwrap();
+    let challenge = read_message(&mut client, 4096, 65_536).await.unwrap();
+    assert_eq!(challenge.payload.first(), Some(&0xed));
+    write_message(
+        &mut client,
+        tds::SSPI,
+        &ntlm_authenticate("CORP", "scanner", "WS-17"),
+        4096,
+    )
+    .await
+    .unwrap();
     let response = read_message(&mut client, 4096, 65_536).await.unwrap();
     assert_eq!(response.payload.first(), Some(&0xaa));
     drop(client);
@@ -440,6 +455,15 @@ async fn direct_ntlm_login_is_classified_without_putting_token_in_events() {
     assert_eq!(login["integrated_security"], true);
     assert_eq!(login["sspi_bytes"], token.len());
     assert_eq!(login["sspi_token_family"], "ntlmssp");
+    let continuation = events
+        .iter()
+        .find(|event| event["event_type"] == "sspi_message" && event["phase"] == "continuation")
+        .expect("SSPI continuation telemetry");
+    assert_eq!(continuation["message_type"], 3);
+    assert_eq!(continuation["domain"], "CORP");
+    assert_eq!(continuation["username"], "scanner");
+    assert_eq!(continuation["workstation"], "WS-17");
+    assert_eq!(continuation["nt_response_variant"], "ntlmv2");
     assert!(
         !std::fs::read_to_string(&telemetry_path)
             .unwrap()
@@ -489,6 +513,45 @@ async fn malformed_direct_login_never_enters_generic_wire_diagnostics() {
         !std::fs::read_to_string(&telemetry_path)
             .unwrap()
             .contains("secret-marker")
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn incomplete_login7_is_archived_with_packet_headers() {
+    let temp = tempfile::tempdir().unwrap();
+    let telemetry_path = temp.path().join("events.jsonl");
+    let payload_directory = temp.path().join("payloads");
+    let mut config = Config::default();
+    config.listener.address = "127.0.0.1:0".into();
+    config.telemetry.jsonl_path = Some(telemetry_path.to_string_lossy().into_owned());
+    config.telemetry.stdout = false;
+    config.payloads.enabled = true;
+    config.payloads.capture_login_messages = true;
+    config.payloads.directory = payload_directory.to_string_lossy().into_owned();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(Server::new(config).await.unwrap().serve(listener, false));
+
+    let mut wire = vec![tds::LOGIN7, 1, 0, 64, 0, 0, 1, 0];
+    wire.extend_from_slice(b"partial-login-secret");
+    let mut client = TcpStream::connect(address).await.unwrap();
+    client.write_all(&wire).await.unwrap();
+    drop(client);
+
+    let events = wait_for_events(&telemetry_path, "connection_close").await;
+    let capture = events
+        .iter()
+        .find(|event| event["event_type"] == "incomplete_authentication_message_capture")
+        .expect("incomplete authentication artifact");
+    assert_eq!(capture["packet_type"], tds::LOGIN7);
+    assert_eq!(capture["wire_format"], "tds_packets_with_headers");
+    let stored = payload_directory.join(format!("{}.bin", capture["storage_id"].as_str().unwrap()));
+    assert_eq!(std::fs::read(stored).unwrap(), wire);
+    assert!(
+        !std::fs::read_to_string(&telemetry_path)
+            .unwrap()
+            .contains("partial-login-secret")
     );
     task.abort();
 }
@@ -567,6 +630,8 @@ async fn framed_malformed_login7_is_detected_archived_and_field_diagnosed() {
     write_message(&mut client, tds::LOGIN7, &payload, 4096)
         .await
         .unwrap();
+    let response = read_message(&mut client, 4096, 65_536).await.unwrap();
+    assert_eq!(response.payload.first(), Some(&0xaa));
     drop(client);
 
     let events = wait_for_events(&telemetry_path, "connection_close").await;
@@ -586,20 +651,22 @@ async fn framed_malformed_login7_is_detected_archived_and_field_diagnosed() {
         .expect("pre-parse LOGIN7 artifact");
     let stored = payload_directory.join(format!("{}.bin", capture["storage_id"].as_str().unwrap()));
     assert_eq!(std::fs::read(stored).unwrap(), payload);
-    let failure = events
+    let login = events
         .iter()
-        .find(|event| event["event_type"] == "connection_failure")
-        .expect("connection failure event");
-    assert_eq!(failure["protocol_stage"], "login_parse");
-    assert_eq!(
-        failure["error"],
-        "TDS protocol error: LOGIN7 username field is outside message (offset=146, bytes=4, declared=147)"
+        .find(|event| event["event_type"] == "login_attempt")
+        .expect("recoverable malformed login telemetry");
+    assert_eq!(login["structurally_valid"], false);
+    assert_eq!(login["accepted"], false);
+    assert!(
+        login["parse_warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("username field is outside message")
     );
-    assert!(failure["direct_login_header_hex"].is_null());
     assert!(
         !events
             .iter()
-            .any(|event| event["event_type"] == "login_attempt")
+            .any(|event| event["event_type"] == "connection_failure")
     );
     task.abort();
 }
@@ -653,6 +720,13 @@ fn login7(username: &str, password: &str, application: &str, database: &str) -> 
     packet
 }
 
+fn with_transaction_header(body: &[u8]) -> Vec<u8> {
+    let mut payload = vec![22, 0, 0, 0, 18, 0, 0, 0, 2, 0];
+    payload.extend_from_slice(&[0; 12]);
+    payload.extend_from_slice(body);
+    payload
+}
+
 fn integrated_login7(token: &[u8]) -> Vec<u8> {
     let mut packet = vec![0_u8; 94];
     packet[4..8].copy_from_slice(&0x7100_0001_u32.to_le_bytes());
@@ -663,6 +737,34 @@ fn integrated_login7(token: &[u8]) -> Vec<u8> {
     packet.extend_from_slice(token);
     let length = packet.len() as u32;
     packet[0..4].copy_from_slice(&length.to_le_bytes());
+    packet
+}
+
+fn ntlm_authenticate(domain: &str, username: &str, workstation: &str) -> Vec<u8> {
+    fn encoded(value: &str) -> Vec<u8> {
+        value.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+    fn descriptor(packet: &mut [u8], at: usize, offset: usize, bytes: usize) {
+        packet[at..at + 2].copy_from_slice(&(bytes as u16).to_le_bytes());
+        packet[at + 2..at + 4].copy_from_slice(&(bytes as u16).to_le_bytes());
+        packet[at + 4..at + 8].copy_from_slice(&(offset as u32).to_le_bytes());
+    }
+
+    let lm = vec![1; 24];
+    let nt = vec![2; 48];
+    let domain = encoded(domain);
+    let username = encoded(username);
+    let workstation = encoded(workstation);
+    let fields = [lm, nt, domain, username, workstation, Vec::new()];
+    let mut packet = vec![0_u8; 64];
+    packet[..8].copy_from_slice(b"NTLMSSP\0");
+    packet[8..12].copy_from_slice(&3_u32.to_le_bytes());
+    packet[60..64].copy_from_slice(&1_u32.to_le_bytes());
+    for (index, value) in fields.into_iter().enumerate() {
+        let offset = packet.len();
+        descriptor(&mut packet, 12 + index * 8, offset, value.len());
+        packet.extend(value);
+    }
     packet
 }
 
