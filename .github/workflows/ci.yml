@@ -110,7 +110,9 @@ jobs:
           cache-from: type=gha,scope=ci-${{ matrix.artifact }}
           cache-to: type=gha,mode=max,scope=ci-${{ matrix.artifact }}
       - name: Smoke test native image
-        run: docker run --rm --entrypoint /usr/local/bin/metis-tds metis-tds:ci-${{ matrix.artifact }} --help
+        env:
+          IMAGE_TAG: metis-tds:ci-${{ matrix.artifact }}
+        run: docker run --rm --entrypoint /usr/local/bin/metis-tds "${IMAGE_TAG}" --help
       - name: Generate container SBOM
         if: matrix.artifact == 'amd64'
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
