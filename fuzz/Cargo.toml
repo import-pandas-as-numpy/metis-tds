@@ -10,7 +10,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "=0.4.13"
-metis-tds = { path = "..", version = "=0.1.6" }
+metis-tds = { path = "..", version = "=0.1.7" }
 
 [[bin]]
 name = "packet"
