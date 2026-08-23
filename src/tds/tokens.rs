@@ -1,9 +1,11 @@
 use crate::{Error, Result};
 
 const LOGINACK: u8 = 0xad;
+const CAPABILITY: u8 = 0xe2;
 const ENVCHANGE: u8 = 0xe3;
 const ERROR: u8 = 0xaa;
 const INFO: u8 = 0xab;
+const FEATUREEXTACK: u8 = 0xae;
 const COLMETADATA: u8 = 0x81;
 const COLNAME: u8 = 0xa0;
 const COLFMT: u8 = 0xa1;
@@ -11,6 +13,7 @@ const ROW: u8 = 0xd1;
 const DONE: u8 = 0xfd;
 const DONEPROC: u8 = 0xfe;
 const SSPI: u8 = 0xed;
+const FEDAUTHINFO: u8 = 0xee;
 const DONE_MORE: u16 = 0x0001;
 const DONE_ERROR: u16 = 0x0002;
 const DONE_COUNT: u16 = 0x0010;
@@ -18,12 +21,18 @@ const DONE_COUNT: u16 = 0x0010;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Protocol {
     Tds42,
+    Tds46,
+    Tds50,
     Tds7(u32),
 }
 
 impl Protocol {
+    pub(crate) fn is_legacy(self) -> bool {
+        matches!(self, Self::Tds42 | Self::Tds46 | Self::Tds50)
+    }
+
     fn uses_legacy_strings(self) -> bool {
-        self == Self::Tds42
+        self.is_legacy()
     }
 
     fn uses_wide_fields(self) -> bool {
@@ -54,21 +63,57 @@ pub struct SqlError {
     pub message: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeatureAck {
+    pub id: u8,
+    pub data: Vec<u8>,
+}
+
 pub fn login_success(
     protocol: Protocol,
     database: &str,
     language: &str,
     packet_size: u32,
     product_name: &str,
+    feature_acks: &[FeatureAck],
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    if protocol == Protocol::Tds42 {
-        length_prefixed(&mut out, LOGINACK, |body| {
-            body.push(1);
-            body.extend_from_slice(&0x0402_0000_u32.to_be_bytes());
-            legacy_b_varchar(body, product_name);
-            body.extend_from_slice(&[95, 16, 0, 89]);
-        })?;
+    if matches!(protocol, Protocol::Tds42 | Protocol::Tds46) {
+        let version = if protocol == Protocol::Tds46 {
+            0x0406_0000
+        } else {
+            0x0402_0000
+        };
+        legacy_login_ack(&mut out, 1, version, product_name)?;
+        done(&mut out, protocol, DONE, 0, 0);
+        return Ok(out);
+    }
+    if protocol == Protocol::Tds50 {
+        // A TDS 5 client does not treat the TDS 4.2 ACK value as a
+        // successful login.  Mirror the login token sequence emitted by an
+        // OpenServer/ASE endpoint: environment changes, ACK=5, negotiated
+        // capabilities, then DONE.
+        envchange_legacy(&mut out, 1, database, "")?;
+        info(
+            &mut out,
+            protocol,
+            5701,
+            2,
+            &format!("Changed database context to '{database}'."),
+            "",
+        )?;
+        envchange_legacy(&mut out, 2, language, "")?;
+        info(
+            &mut out,
+            protocol,
+            5703,
+            1,
+            &format!("Changed language setting to {language}."),
+            "",
+        )?;
+        envchange_legacy(&mut out, 4, &packet_size.to_string(), "")?;
+        legacy_login_ack(&mut out, 5, 0x0500_0000, product_name)?;
+        tds5_capabilities(&mut out);
         done(&mut out, protocol, DONE, 0, 0);
         return Ok(out);
     }
@@ -100,9 +145,36 @@ pub fn login_success(
         b_varchar(body, product_name);
         body.extend_from_slice(&[16, 0, 16, 89]);
     })?;
+    feature_ext_ack(&mut out, feature_acks)?;
     envchange(&mut out, 4, &packet_size.to_string(), "4096")?;
     done(&mut out, protocol, DONE, 0, 0);
     Ok(out)
+}
+
+pub fn tds5_login_negotiation(challenge: &[u8], product_name: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    legacy_login_ack(&mut out, 7, 0x0500_0000, product_name)?;
+    out.extend_from_slice(challenge);
+    done(&mut out, Protocol::Tds50, DONE, 0, 0);
+    Ok(out)
+}
+
+fn feature_ext_ack(out: &mut Vec<u8>, features: &[FeatureAck]) -> Result<()> {
+    if features.is_empty() {
+        return Ok(());
+    }
+    out.push(FEATUREEXTACK);
+    for feature in features {
+        out.push(feature.id);
+        out.extend_from_slice(
+            &u32::try_from(feature.data.len())
+                .map_err(|_| Error::Limit("FEATUREEXTACK data"))?
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&feature.data);
+    }
+    out.push(0xff);
+    Ok(())
 }
 
 pub fn login_failure(protocol: Protocol, server: &str, locked: bool) -> Result<Vec<u8>> {
@@ -123,6 +195,10 @@ pub fn login_failure(protocol: Protocol, server: &str, locked: bool) -> Result<V
         },
         server,
     )?;
+    if protocol == Protocol::Tds50 {
+        // Unlike TDS 4.2, TDS 5 carries an explicit negative login ACK.
+        legacy_login_ack(&mut out, 6, 0x0500_0000, server)?;
+    }
     done(&mut out, protocol, DONE, DONE_ERROR, 0);
     Ok(out)
 }
@@ -131,6 +207,44 @@ pub fn sspi_challenge(token: &[u8]) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     length_prefixed(&mut output, SSPI, |body| body.extend_from_slice(token))?;
     Ok(output)
+}
+
+pub fn fedauth_info(sts_url: &str, spn: &str) -> Result<Vec<u8>> {
+    let sts_url = utf16(sts_url);
+    let spn = utf16(spn);
+    let descriptor_bytes = 2_usize * 9;
+    let first_offset = 4_usize + descriptor_bytes;
+    let second_offset = first_offset
+        .checked_add(sts_url.len())
+        .ok_or(Error::Limit("FEDAUTHINFO offset"))?;
+    let token_length = second_offset
+        .checked_add(spn.len())
+        .ok_or(Error::Limit("FEDAUTHINFO token"))?;
+
+    let mut out = Vec::with_capacity(5 + token_length);
+    out.push(FEDAUTHINFO);
+    out.extend_from_slice(
+        &u32::try_from(token_length)
+            .map_err(|_| Error::Limit("FEDAUTHINFO token"))?
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(&2_u32.to_le_bytes());
+    for (id, value, offset) in [(1_u8, &sts_url, first_offset), (2_u8, &spn, second_offset)] {
+        out.push(id);
+        out.extend_from_slice(
+            &u32::try_from(value.len())
+                .map_err(|_| Error::Limit("FEDAUTHINFO value"))?
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(
+            &u32::try_from(offset)
+                .map_err(|_| Error::Limit("FEDAUTHINFO offset"))?
+                .to_le_bytes(),
+        );
+    }
+    out.extend_from_slice(&sts_url);
+    out.extend_from_slice(&spn);
+    Ok(out)
 }
 
 pub fn response(
@@ -157,13 +271,13 @@ pub fn response(
         return Ok(out);
     }
     for (index, set) in result_sets.iter().enumerate() {
-        if protocol == Protocol::Tds42 {
+        if protocol.is_legacy() {
             legacy_colmetadata(&mut out, &set.columns)?;
         } else {
             colmetadata(&mut out, protocol, &set.columns)?;
         }
         for row in &set.rows {
-            if protocol == Protocol::Tds42 {
+            if protocol.is_legacy() {
                 legacy_row_token(&mut out, row, set.columns.len())?;
             } else {
                 row_token(&mut out, row, set.columns.len())?;
@@ -276,6 +390,44 @@ fn envchange(out: &mut Vec<u8>, kind: u8, new: &str, old: &str) -> Result<()> {
         b_varchar(body, new);
         b_varchar(body, old);
     })
+}
+
+fn envchange_legacy(out: &mut Vec<u8>, kind: u8, new: &str, old: &str) -> Result<()> {
+    length_prefixed(out, ENVCHANGE, |body| {
+        body.push(kind);
+        legacy_b_varchar(body, new);
+        legacy_b_varchar(body, old);
+    })
+}
+
+fn legacy_login_ack(
+    out: &mut Vec<u8>,
+    acknowledgement: u8,
+    version: u32,
+    product_name: &str,
+) -> Result<()> {
+    length_prefixed(out, LOGINACK, |body| {
+        body.push(acknowledgement);
+        body.extend_from_slice(&version.to_be_bytes());
+        legacy_b_varchar(body, product_name);
+        // TDS 4.2/5.0 use the legacy four-byte program-version layout:
+        // VersionMark (fixed at 95), major, minor, and an 8-bit build.
+        // This is not the modern LOGINACK's major/minor/16-bit-build field.
+        body.extend_from_slice(&[95, 16, 0, 89]);
+    })
+}
+
+fn tds5_capabilities(out: &mut Vec<u8>) {
+    // The two seven-byte request/response capability bitmaps used by the
+    // FreeTDS OpenServer implementation.  Keeping the complete token here is
+    // important: clients use it to decide whether to send TDS 5 LANGUAGE,
+    // DBRPC, DYNAMIC, cursor, and parameter-format tokens.
+    const BODY: [u8; 18] = [
+        1, 7, 7, 97, 65, 207, 255, 255, 230, 2, 7, 0, 0, 2, 0, 0, 0, 0,
+    ];
+    out.push(CAPABILITY);
+    out.extend_from_slice(&(BODY.len() as u16).to_le_bytes());
+    out.extend_from_slice(&BODY);
 }
 
 fn envchange_binary(out: &mut Vec<u8>, kind: u8, new: &[u8], old: &[u8]) -> Result<()> {
@@ -427,6 +579,7 @@ mod tests {
             "us_english",
             4096,
             "Microsoft SQL Server",
+            &[],
         )
         .unwrap();
         assert!(login.contains(&LOGINACK));
@@ -451,6 +604,7 @@ mod tests {
             "us_english",
             4096,
             "Microsoft SQL Server",
+            &[],
         )
         .unwrap();
         assert_eq!(login[0], LOGINACK);
@@ -503,6 +657,7 @@ mod tests {
             "us_english",
             4096,
             "Microsoft SQL Server",
+            &[],
         )
         .unwrap();
         let login_ack = login.iter().position(|byte| *byte == LOGINACK).unwrap();
@@ -528,6 +683,93 @@ mod tests {
         assert_eq!(
             encoded.len() - encoded.iter().rposition(|b| *b == DONE).unwrap(),
             9
+        );
+    }
+
+    #[test]
+    fn encodes_a_tds50_login_handshake_and_negative_ack() {
+        let success = login_success(
+            Protocol::Tds50,
+            "master",
+            "us_english",
+            512,
+            "Adaptive Server Enterprise",
+            &[],
+        )
+        .unwrap();
+
+        let login_ack = success.iter().position(|byte| *byte == LOGINACK).unwrap();
+        assert_eq!(success[login_ack + 3], 5);
+        assert_eq!(
+            &success[login_ack + 4..login_ack + 8],
+            &0x0500_0000_u32.to_be_bytes()
+        );
+        let capability = success.iter().position(|byte| *byte == CAPABILITY).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([success[capability + 1], success[capability + 2]]),
+            18
+        );
+        assert_eq!(success.last(), Some(&0)); // final byte of the 9-byte DONE
+        assert_eq!(success[success.len() - 9], DONE);
+
+        let failure = login_failure(Protocol::Tds50, "SYB-PROD-01", false).unwrap();
+        let login_ack = failure.iter().position(|byte| *byte == LOGINACK).unwrap();
+        assert_eq!(failure[login_ack + 3], 6);
+        assert_eq!(failure[failure.len() - 9], DONE);
+
+        let negotiation = tds5_login_negotiation(&[0x65, 3, 1, 35, 0], "ASE").unwrap();
+        assert_eq!(negotiation[0], LOGINACK);
+        assert_eq!(negotiation[3], 7);
+        assert!(
+            negotiation
+                .windows(5)
+                .any(|window| window == [0x65, 3, 1, 35, 0])
+        );
+        assert_eq!(negotiation[negotiation.len() - 9], DONE);
+    }
+
+    #[test]
+    fn encodes_fedauth_info_offsets_from_the_count_field() {
+        let token =
+            fedauth_info("https://login.invalid/token", "https://database.invalid/").unwrap();
+        assert_eq!(token[0], FEDAUTHINFO);
+        let declared = u32::from_le_bytes(token[1..5].try_into().unwrap()) as usize;
+        assert_eq!(declared, token.len() - 5);
+        assert_eq!(&token[5..9], &2_u32.to_le_bytes());
+        let first_offset = u32::from_le_bytes(token[14..18].try_into().unwrap()) as usize;
+        let second_offset = u32::from_le_bytes(token[23..27].try_into().unwrap()) as usize;
+        assert_eq!(first_offset, 22);
+        assert!(second_offset > first_offset);
+        assert_eq!(5 + first_offset, 27);
+    }
+
+    #[test]
+    fn encodes_terminated_feature_acknowledgements() {
+        let login = login_success(
+            Protocol::Tds7(0x7400_0004),
+            "master",
+            "us_english",
+            4096,
+            "Microsoft SQL Server",
+            &[
+                FeatureAck {
+                    id: 0x04,
+                    data: vec![1],
+                },
+                FeatureAck {
+                    id: 0x0e,
+                    data: vec![2],
+                },
+            ],
+        )
+        .unwrap();
+        let start = login
+            .iter()
+            .position(|byte| *byte == FEATUREEXTACK)
+            .unwrap();
+        assert_eq!(
+            &login[start..start + 14],
+            &[0xae, 0x04, 1, 0, 0, 0, 1, 0x0e, 1, 0, 0, 0, 2, 0xff]
         );
     }
 }

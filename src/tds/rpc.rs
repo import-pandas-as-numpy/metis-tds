@@ -77,6 +77,71 @@ pub fn parse_with_context(
     )
 }
 
+/// Parse an RPC Request carried by a Microsoft TDS 4.2 packet (type 0x03).
+/// TDS 5.0 RPCs instead arrive as DBRPC/PARAMFMT/PARAMS tokens in a type 0x0f
+/// message and are handled by `tds5`.
+pub fn parse_legacy42(payload: &[u8], max_parameter_bytes: usize) -> Result<RpcRequest> {
+    let mut cursor = Cursor::new(payload, max_parameter_bytes, "TDS 4.2 RPC request");
+    let mut batches = Vec::new();
+    let mut separator = None;
+    while !cursor.done() {
+        let procedure = cursor.mbcs_b_varchar()?;
+        if procedure.is_empty() {
+            return Err(Error::Protocol("empty TDS 4.2 RPC procedure name".into()));
+        }
+        let options = cursor.u16()?;
+        let mut parameters = Vec::new();
+        let mut next_separator = None;
+        while !cursor.done() {
+            if cursor.peek() == Some(0x80) {
+                cursor.u8()?;
+                next_separator = Some(0x80);
+                break;
+            }
+            let name = cursor.mbcs_b_varchar()?;
+            let status = cursor.u8()?;
+            let ty = cursor.type_info_legacy42()?;
+            let value = cursor.value(&ty)?;
+            parameters.push(RpcParameter {
+                name,
+                status,
+                type_id: ty.id,
+                type_name: ty.name,
+                value,
+                encryption: None,
+            });
+            if parameters.len() > 1024 {
+                return Err(Error::Limit("RPC parameter count"));
+            }
+        }
+        batches.push(RpcBatch {
+            separator,
+            procedure,
+            options,
+            enclave_package_bytes: None,
+            no_execute: false,
+            parameters,
+        });
+        if batches.len() > 1024 {
+            return Err(Error::Limit("RPC batch count"));
+        }
+        separator = next_separator;
+        if separator.is_none() || cursor.done() {
+            break;
+        }
+    }
+    let first = batches
+        .first()
+        .ok_or_else(|| Error::Protocol("empty TDS 4.2 RPC request".into()))?;
+    Ok(RpcRequest {
+        procedure: first.procedure.clone(),
+        options: first.options,
+        parameters: first.parameters.clone(),
+        batches,
+        headers: Vec::new(),
+    })
+}
+
 fn parse_inner(
     payload: &[u8],
     max_parameter_bytes: usize,
@@ -258,7 +323,47 @@ mod tests {
     fn malformed_rpc_never_panics() {
         for len in 0..256 {
             let _ = parse(&vec![0x7f; len], 1024);
+            let _ = parse_legacy42(&vec![0x7f; len], 1024);
         }
+    }
+
+    #[test]
+    fn parses_tds42_rpc_request_example() {
+        // MS-SSTDS section 4.6: p_alltypes(@bigintcol smallint = 1).
+        let mut raw = Vec::new();
+        raw.push(10);
+        raw.extend_from_slice(b"p_alltypes");
+        raw.extend_from_slice(&0_u16.to_le_bytes());
+        raw.push(10);
+        raw.extend_from_slice(b"@bigintcol");
+        raw.push(0);
+        raw.push(0x34);
+        raw.extend_from_slice(&1_i16.to_le_bytes());
+
+        let rpc = parse_legacy42(&raw, 4096).unwrap();
+        assert_eq!(rpc.procedure, "p_alltypes");
+        assert_eq!(rpc.parameters[0].name, "@bigintcol");
+        assert_eq!(rpc.parameters[0].value, RpcValue::Integer(1));
+    }
+
+    #[test]
+    fn parses_batched_tds42_rpc_requests() {
+        let mut raw = Vec::new();
+        for (separator, procedure) in [(None, "sp_one"), (Some(0x80), "sp_two")] {
+            if let Some(separator) = separator {
+                raw.push(separator);
+            }
+            raw.push(procedure.len() as u8);
+            raw.extend_from_slice(procedure.as_bytes());
+            raw.extend_from_slice(&0_u16.to_le_bytes());
+        }
+        // A trailing BatchFlag is explicitly permitted and ignored.
+        raw.push(0x80);
+
+        let rpc = parse_legacy42(&raw, 4096).unwrap();
+        assert_eq!(rpc.batches.len(), 2);
+        assert_eq!(rpc.batches[1].procedure, "sp_two");
+        assert_eq!(rpc.batches[1].separator, Some(0x80));
     }
 
     #[test]
@@ -322,7 +427,7 @@ mod tests {
         let rpc = parse(&raw, 4096).unwrap();
         assert_eq!(
             rpc.parameters[0].value.telemetry_value(),
-            "<table:1 columns:1 rows>"
+            "<table:1 columns:1 rows sample:[[\"42\"]]>"
         );
     }
 

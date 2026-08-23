@@ -2,7 +2,29 @@
 
 All notable user-visible changes are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.1.9 - 2026-08-23
+
+### Added
+
+- Parse and inventory published TDS 4.2, 4.6, 5.0, 7.x, and 8.0 transport, authentication, request, token, datatype, and feature-extension structures with bounded recovery for malformed or future input.
+- Negotiate and recover passwords from ASE RSA/OAEP extended-password v2 and nonce-bound extended-plus v3/v4 authentication, including v4 symmetric session keys.
+- Preserve semantic authentication telemetry for malformed FEDAUTH, NTLM, SPNEGO/Kerberos, ASE secure-login, and unknown TDS 5 token streams without copying credentials into generic failure diagnostics.
+
+### Fixed
+
+- Generate per-attempt RSA keypairs for non-nonce ASE password negotiation and reject a continuation whose message version does not match the negotiated handshake.
+- Emit ASE secure-login continuation telemetry before rejecting missing, mismatched, or undecryptable password material.
+- Elicit the published ASE proprietary-v1 secure-login exchange and retain its exact challenge key and response ciphertext without falsely claiming plaintext recovery for the unpublished cipher.
+- Classify complete and truncated ASE secure-login continuations by protocol stage so their raw artifacts follow the dedicated authentication-capture policy, and fingerprint encrypted-command packets for cross-capture analysis.
+- Accept both published ASE `DYNAMIC2` token assignments (`0x62` and `0xA3`).
+- Recover embedded TDS 5 authentication streams even when the surrounding LOGIN capability framing is missing or corrupt, and emit identity/security intent before a continuation handshake can time out.
+- Inventory version-specific TDS 4.2, 4.6, and 5.0 LOGIN fields including host process, client charset/version, bulk/security/HA flags, fixed padding, and remote-password encoding.
+- Preserve truncated LOGIN7 FeatureExt entries as bounded remainder telemetry, keep partial FEDAUTH classified as authentication, and expose its exact available material only when credential capture is enabled.
+- Route direct ASE normal (`0x0f`) and command-sequence-login (`0x14`) packets through semantic TDS 5 authentication parsing instead of treating them as failed PRELOGIN messages.
+- Parse a TDS 8 LOGIN/authentication message that arrives immediately after TLS even when PRELOGIN was skipped, and retain a truncated version under the restricted incomplete-authentication artifact policy.
+- Inventory unnegotiated SMP/MARS frames at live ingress and inspect complete or partial DATA payloads for nested LOGIN7, SSPI, FEDAUTH, and TDS 5 authentication, keeping the enclosing frame under the restricted authentication-capture policy when found.
+- Share parser-owned inventories across LOGIN7 feature dispatch, all 35 published TDS 5 message types, and the published TDS 5 token boundary fixtures so coverage tests cannot silently narrow their own scope.
+- Compile every maintained fuzz target in pull-request CI and keep its lockfile synchronized with the main parser crate, preventing harness drift from remaining hidden until the scheduled fuzz job.
 
 ## 0.1.7 - 2026-08-23
 

@@ -5,12 +5,12 @@
 [![fuzzing](https://github.com/import-pandas-as-numpy/metis-tds/actions/workflows/fuzz.yml/badge.svg)](https://github.com/import-pandas-as-numpy/metis-tds/actions/workflows/fuzz.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Metis is a contained Microsoft SQL Server TDS 7.x/8.0 honeypot. It accepts real TDS connections, records login and request telemetry, classifies attacker intent, and returns synthetic SQL Server responses. It never executes submitted SQL, commands, assemblies, paths, or network destinations.
+Metis is a contained Microsoft SQL Server and SAP ASE TDS honeypot. It accepts real TDS connections, records login and request telemetry, classifies attacker intent, and returns synthetic database responses. It never executes submitted SQL, commands, assemblies, paths, or network destinations.
 
 > [!CAUTION]
 > Metis receives untrusted network traffic and can deliberately record attacker-supplied credentials. Deploy it only on infrastructure you own or are authorized to operate, inside the containment boundary described below. It is pre-1.0 research software, not a database server or a security boundary by itself.
 
-Protocol behavior is implemented from Microsoft's current MS-TDS and MS-SSTDS open specifications. The project supports bounded multi-packet framing, TDS 4.2 LOGIN (`0x02`), PRELOGIN and direct LOGIN7, TDS 7.x-wrapped TLS 1.2/1.3, TDS 8.0 TLS-before-PRELOGIN with `tds/8.0` ALPN, SQL batches, common RPC parameters, stateful attacker-oriented semantics, synthetic result sets, JSONL telemetry, and bounded payload capture.
+Protocol behavior is implemented from the current Microsoft MS-TDS/MS-SSTDS specifications and published SAP/Open Client structures. The project supports bounded TDS 4.2, 4.6, 5.0, 7.x, and 8.0 framing; legacy and LOGIN7 authentication; SQL, RPC, bulk, transaction, federated, NTLM, SPNEGO/Kerberos, and ASE token streams; ASE proprietary-v1 ciphertext negotiation and RSA password negotiation versions 2–4; stateful attacker-oriented semantics; synthetic result sets; JSONL telemetry; and bounded payload capture. See [protocol coverage and evidence](docs/protocol-coverage.md) for precise guarantees and the remaining proprietary cryptographic boundaries.
 
 ## Safety boundary
 
@@ -30,7 +30,7 @@ The example personality is entirely fictional and intentionally contains weak ho
 
 Do not expose the public example unchanged. Its server identity, users, schema, and seed records are visible in this repository and are therefore fingerprintable. Create a private deployment configuration with a distinct fictional organization, identities, values, and TLS material. Configuration belongs at deploy time and is never baked into the image.
 
-The research example enables `telemetry.capture_login_passwords` and `payloads.capture_login_messages`. Clear attempted passwords are written only to the mode-`0600` JSONL sink; validation forbids enabling that option while stdout telemetry is active. Every fully framed TDS 4.2 LOGIN or LOGIN7 message is stored before parsing as a mode-`0600` generated artifact. Parser failures never include login payload bytes; a direct-login framing failure may include at most its credential-free eight-byte TDS header. The older `payloads.capture_login7` key remains a backward-compatible alias.
+The research example enables `telemetry.capture_login_passwords` and `payloads.capture_login_messages`. Clear attempted passwords are written only to the mode-`0600` JSONL sink; validation forbids enabling that option while stdout telemetry is active. Every fully framed TDS 4.2/5.0 LOGIN, LOGIN7, and stage-identified authentication continuation is stored before parsing as a mode-`0600` generated artifact. Incomplete authentication exchanges are retained under the same policy. Parser failures never include login payload bytes in generic diagnostics; a direct-login framing failure may include at most its credential-free eight-byte TDS header. The older `payloads.capture_login7` key remains a backward-compatible alias.
 
 `personality.accept_source_after_attempts` optionally admits a source after a configurable number of parsed SQL-auth attempts regardless of the submitted username/password. A value of `X` applies normal authentication to attempts 1 through `X`, then accepts attempt `X+1` and later from that IP. `null` disables the behavior. Counters are in-memory, reset on restart, and do not count or bypass integrated authentication.
 
@@ -41,13 +41,13 @@ TLS certificate conversion, systemd hardening, outbound-deny guidance, and Inter
 Release images for `linux/amd64` and `linux/arm64` are public and can be pulled anonymously from GHCR. Pin the reviewed release or, preferably, the manifest digest recorded by the registry:
 
 ```console
-docker pull ghcr.io/import-pandas-as-numpy/metis-tds:0.1.7
+docker pull ghcr.io/import-pandas-as-numpy/metis-tds:0.1.9
 docker run --read-only --cap-drop=ALL --security-opt=no-new-privileges \
   --tmpfs /tmp:rw,noexec,nosuid,size=16m \
   --mount type=bind,src="$PWD/config/local.json",dst=/etc/metis-tds/config.json,readonly \
   --mount type=volume,src=metis-tds-data,dst=/var/lib/metis-tds \
   --mount type=volume,src=metis-tds-logs,dst=/var/log/metis-tds \
-  -p 1433:1433 ghcr.io/import-pandas-as-numpy/metis-tds:0.1.7
+  -p 1433:1433 ghcr.io/import-pandas-as-numpy/metis-tds:0.1.9
 ```
 
 The image does not contain a deployment configuration. Supply one at runtime at `/etc/metis-tds/config.json`; for container networking its `listener.address` must use `0.0.0.0:1433`. Keep telemetry and captured-payload paths in the mounted data volumes. For an Internet-facing deployment, enable TLS and enforce outbound denial at the container or host network boundary.
@@ -63,7 +63,7 @@ cargo deny check
 cargo deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check
 ```
 
-The test suite includes a strict standalone TDS 4.2 login/query/result flow, independent Tiberius client flows for plaintext SQL batch/RPC and required TDS 7.x TLS, and a strict TDS 8.0 raw-TLS/PRELOGIN/LOGIN7 flow. `sqlcmd`, SSMS, FreeTDS, Impacket, Censys, and Shodan remain unclaimed until they have been exercised against a deployed instance.
+The test suite includes strict TDS 4.2, 4.6, and 5.0 login/query/result flows, ASE RSA v2/v3/v4 authentication flows, independent Tiberius client flows for plaintext SQL batch/RPC and TDS 7.x TLS, and a strict TDS 8.0 raw-TLS/PRELOGIN/LOGIN7 flow. `sqlcmd`, SSMS, FreeTDS, Impacket, Censys, and Shodan remain unclaimed until they have been exercised against a deployed instance.
 
 Coverage-guided fuzz targets are isolated from the production dependency graph under `fuzz/`. They require nightly Rust and `cargo-fuzz 0.13.2`:
 
@@ -82,6 +82,7 @@ The corpus directories are intentionally retained. On ptrace-restricted hosts wh
 - [Code of conduct](CODE_OF_CONDUCT.md)
 - [Support](SUPPORT.md)
 - [Changelog](CHANGELOG.md)
+- [Protocol coverage](docs/protocol-coverage.md)
 - [Secure deployment](docs/deployment.md)
 
 ## License

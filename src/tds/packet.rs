@@ -1,12 +1,11 @@
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{Error, Result};
 
 const HEADER_LEN: usize = 8;
 const STATUS_EOM: u8 = 0x01;
-const STATUS_IGNORE: u8 = 0x02;
-const STATUS_RESET_CONNECTION: u8 = 0x08;
-const STATUS_RESET_CONNECTION_SKIP_TRAN: u8 = 0x10;
+pub const STATUS_SYMMETRIC_ENCRYPTION: u8 = 0x40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
@@ -27,21 +26,11 @@ impl Header {
                 raw[0], raw[1], raw[6]
             )));
         }
-        // MS-TDS requires receivers to ignore undefined status bits. Validate
-        // only combinations that the specification explicitly forbids.
-        if raw[1] & STATUS_IGNORE != 0 && raw[1] & STATUS_EOM == 0 {
-            return Err(Error::Protocol(format!(
-                "TDS IGNORE status requires EOM (type=0x{:02x}, status=0x{:02x}, packet_id={})",
-                raw[0], raw[1], raw[6]
-            )));
-        }
-        if raw[1] & STATUS_RESET_CONNECTION != 0 && raw[1] & STATUS_RESET_CONNECTION_SKIP_TRAN != 0
-        {
-            return Err(Error::Protocol(format!(
-                "mutually exclusive TDS reset flags (type=0x{:02x}, status=0x{:02x}, packet_id={})",
-                raw[0], raw[1], raw[6]
-            )));
-        }
+        // Status bits are protocol-version-specific. For example, 0x02 is
+        // IGNORE in MS-TDS but ATTNACK in legacy/ASE TDS, while 0x08 and 0x10
+        // are reset flags in MS-TDS but EVENT and SEAL in ASE. The framing
+        // reader runs before negotiation has established that context, so it
+        // must preserve rather than reject any status combination.
         Ok(Self {
             packet_type: raw[0],
             status: raw[1],
@@ -79,6 +68,59 @@ pub struct Message {
     pub first_packet_id: u8,
     pub payload: Vec<u8>,
     pub packet_count: u32,
+    /// Header and payload-boundary metadata for every packet in the message.
+    /// Packet status is not necessarily constant across a multi-packet ASE
+    /// message, so retaining only the first header can discard encryption and
+    /// reset signals needed to interpret the corresponding payload slice.
+    pub packets: Vec<PacketDescriptor>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct PacketDescriptor {
+    pub status: u8,
+    pub packet_id: u8,
+    pub body_offset: usize,
+    pub body_bytes: usize,
+}
+
+impl PacketDescriptor {
+    pub fn has_symmetric_encryption(self) -> bool {
+        self.status & STATUS_SYMMETRIC_ENCRYPTION != 0
+    }
+}
+
+pub fn microsoft_status_flags(status: u8) -> Vec<&'static str> {
+    status_flags(
+        status,
+        &[
+            (0x01, "end_of_message"),
+            (0x02, "ignore"),
+            (0x08, "reset_connection"),
+            (0x10, "reset_connection_skip_transaction"),
+        ],
+    )
+}
+
+pub fn legacy_status_flags(status: u8) -> Vec<&'static str> {
+    status_flags(
+        status,
+        &[
+            (0x01, "end_of_message"),
+            (0x02, "attention_acknowledgement"),
+            (0x04, "attention"),
+            (0x08, "event"),
+            (0x10, "seal"),
+            (0x20, "sql_anywhere_encryption"),
+            (0x40, "symmetric_command_encryption"),
+        ],
+    )
+}
+
+fn status_flags(status: u8, meanings: &[(u8, &'static str)]) -> Vec<&'static str> {
+    meanings
+        .iter()
+        .filter_map(|(flag, name)| (status & flag != 0).then_some(*name))
+        .collect()
 }
 
 pub async fn read_message<R: AsyncRead + Unpin>(
@@ -90,27 +132,54 @@ pub async fn read_message<R: AsyncRead + Unpin>(
     let mut expected_type = None;
     let mut first_header = None;
     let mut packet_count = 0_u32;
+    let mut packets = Vec::new();
     loop {
         let mut raw = [0_u8; HEADER_LEN];
         reader.read_exact(&mut raw).await?;
         if raw[0] == 0x53 {
-            // SMP/MARS is not negotiated by this server, but consume the
-            // complete first frame so the lossless ingress capture contains a
-            // useful artifact rather than only half of its 16-byte header.
-            let length = usize::try_from(u32::from_le_bytes(
-                raw[4..8].try_into().expect("length checked"),
-            ))
-            .map_err(|_| Error::Limit("SMP frame"))?;
-            if !(crate::tds::smp::HEADER_LEN..=max_message).contains(&length) {
-                return Err(Error::Protocol(format!(
-                    "invalid SMP frame length {length}"
-                )));
+            // SMP/MARS is not negotiated by this server, but retain a bounded
+            // control-frame prelude through the first DATA or FIN frame. A
+            // normal sequence can begin with SYN, and stopping there would
+            // hide a complete inner authentication message already queued by
+            // a nonconforming peer. The caller's stage timeout still bounds a
+            // client that sends SYN and waits for an ACK we intentionally do
+            // not provide.
+            let mut smp_wire_bytes = 0usize;
+            for frame_count in 1..=256 {
+                let length = usize::try_from(u32::from_le_bytes(
+                    raw[4..8].try_into().expect("length checked"),
+                ))
+                .map_err(|_| Error::Limit("SMP frame"))?;
+                if !(crate::tds::smp::HEADER_LEN..=max_message).contains(&length) {
+                    return Err(Error::Protocol(format!(
+                        "invalid SMP frame length {length}"
+                    )));
+                }
+                smp_wire_bytes = smp_wire_bytes
+                    .checked_add(length)
+                    .ok_or(Error::Limit("SMP ingress bytes"))?;
+                if smp_wire_bytes > max_message {
+                    return Err(Error::Limit("SMP ingress bytes"));
+                }
+                let mut rest = vec![0u8; length - HEADER_LEN];
+                reader.read_exact(&mut rest).await?;
+                if matches!(raw[1], 0x04 | 0x08) || !matches!(raw[1], 0x01 | 0x02) {
+                    return Err(Error::Protocol(
+                        "SMP/MARS frame received without MARS negotiation".into(),
+                    ));
+                }
+                if frame_count == 256 {
+                    return Err(Error::Limit("SMP ingress frame count"));
+                }
+                reader.read_exact(&mut raw).await?;
+                if raw[0] != 0x53 {
+                    return Err(Error::Protocol(format!(
+                        "invalid SMP identifier 0x{:02x}",
+                        raw[0]
+                    )));
+                }
             }
-            let mut rest = vec![0u8; length - HEADER_LEN];
-            reader.read_exact(&mut rest).await?;
-            return Err(Error::Protocol(
-                "SMP/MARS frame received without MARS negotiation".into(),
-            ));
+            unreachable!("bounded SMP frame loop always returns");
         }
         let header = Header::decode(raw, max_packet)?;
         // PacketID is advisory and explicitly ignored by receivers in MS-TDS.
@@ -137,6 +206,12 @@ pub async fn read_message<R: AsyncRead + Unpin>(
         let start = assembled.len();
         assembled.resize(start + body_len, 0);
         reader.read_exact(&mut assembled[start..]).await?;
+        packets.push(PacketDescriptor {
+            status: header.status,
+            packet_id: header.packet_id,
+            body_offset: start,
+            body_bytes: body_len,
+        });
         packet_count = packet_count
             .checked_add(1)
             .ok_or(Error::Limit("TDS packet count"))?;
@@ -148,6 +223,7 @@ pub async fn read_message<R: AsyncRead + Unpin>(
                 first_packet_id: first.packet_id,
                 payload: assembled,
                 packet_count,
+                packets,
             });
         }
         if packet_count > 65_536 {
@@ -206,11 +282,24 @@ mod tests {
     }
 
     #[test]
-    fn accepts_ignore_and_unknown_status_bits_but_rejects_invalid_combinations() {
+    fn preserves_every_status_combination_for_version_aware_interpretation() {
         assert!(Header::decode([1, 0x03, 0, 8, 0, 0, 1, 0], 4096).is_ok());
         assert!(Header::decode([1, 0x41, 0, 8, 0, 0, 1, 0], 4096).is_ok());
-        assert!(Header::decode([1, 0x02, 0, 8, 0, 0, 1, 0], 4096).is_err());
-        assert!(Header::decode([1, 0x19, 0, 8, 0, 0, 1, 0], 4096).is_err());
+        assert!(Header::decode([1, 0x02, 0, 8, 0, 0, 1, 0], 4096).is_ok());
+        assert!(Header::decode([1, 0x19, 0, 8, 0, 0, 1, 0], 4096).is_ok());
+        assert!(Header::decode([1, 0xff, 0, 8, 0, 0, 1, 0], 4096).is_ok());
+        assert_eq!(
+            microsoft_status_flags(0x19),
+            [
+                "end_of_message",
+                "reset_connection",
+                "reset_connection_skip_transaction"
+            ]
+        );
+        assert_eq!(
+            legacy_status_flags(0x19),
+            ["end_of_message", "event", "seal"]
+        );
     }
 
     #[tokio::test]
@@ -223,6 +312,11 @@ mod tests {
         let message = read_message(&mut input, 12, 100).await.unwrap();
         assert_eq!(message.payload, b"abcdefghij");
         assert_eq!(message.packet_count, 3);
+        assert_eq!(message.packets.len(), 3);
+        assert_eq!(message.packets[0].body_offset, 0);
+        assert_eq!(message.packets[0].body_bytes, 4);
+        assert_eq!(message.packets[2].body_offset, 8);
+        assert_eq!(message.packets[2].body_bytes, 2);
     }
 
     #[tokio::test]
@@ -235,5 +329,29 @@ mod tests {
             .unwrap();
         assert_eq!(message.payload, b"ab");
         assert_eq!(message.first_packet_id, 42);
+        assert_eq!(message.packets[0].packet_id, 42);
+        assert_eq!(message.packets[1].packet_id, 7);
+    }
+
+    #[tokio::test]
+    async fn retains_per_packet_symmetric_encryption_status_and_boundaries() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&[15, 0x40, 0, 10, 0, 0, 1, 0, b'a', b'b']);
+        input.extend_from_slice(&[15, 0x41, 0, 11, 0, 0, 2, 0, b'c', b'd', b'e']);
+        let message = read_message(&mut input.as_slice(), 4096, 100)
+            .await
+            .unwrap();
+
+        assert_eq!(message.payload, b"abcde");
+        assert!(
+            message
+                .packets
+                .iter()
+                .all(|packet| packet.has_symmetric_encryption())
+        );
+        assert_eq!(message.packets[0].body_offset, 0);
+        assert_eq!(message.packets[0].body_bytes, 2);
+        assert_eq!(message.packets[1].body_offset, 2);
+        assert_eq!(message.packets[1].body_bytes, 3);
     }
 }

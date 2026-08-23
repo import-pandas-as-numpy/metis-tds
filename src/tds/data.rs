@@ -68,6 +68,7 @@ pub enum Value {
     Table {
         columns: usize,
         rows: usize,
+        sampled_rows: Vec<Vec<String>>,
     },
 }
 
@@ -110,7 +111,21 @@ impl Value {
                     )
                 },
             ),
-            Self::Table { columns, rows } => format!("<table:{columns} columns:{rows} rows>"),
+            Self::Table {
+                columns,
+                rows,
+                sampled_rows,
+            } => {
+                if sampled_rows.is_empty() {
+                    format!("<table:{columns} columns:{rows} rows>")
+                } else {
+                    format!(
+                        "<table:{columns} columns:{rows} rows sample:{}>",
+                        serde_json::to_string(sampled_rows)
+                            .unwrap_or_else(|_| "<unavailable>".into())
+                    )
+                }
+            }
         }
     }
 
@@ -212,6 +227,13 @@ impl<'a> Cursor<'a> {
         self.utf16(chars)
     }
 
+    /// TDS 4.2 B_VARCHAR is a byte-counted MBCS value, unlike the UTF-16
+    /// character-counted B_VARCHAR used by TDS 7.x metadata.
+    pub fn mbcs_b_varchar(&mut self) -> Result<String> {
+        let bytes = usize::from(self.u8()?);
+        Ok(String::from_utf8_lossy(self.take(bytes)?).into_owned())
+    }
+
     pub fn us_varchar(&mut self) -> Result<String> {
         let chars = usize::from(self.u16()?);
         self.utf16(chars)
@@ -235,6 +257,61 @@ impl<'a> Cursor<'a> {
 
     pub fn type_info(&mut self) -> Result<TypeInfo> {
         let id = self.u8()?;
+        self.type_info_after_id(id)
+    }
+
+    /// Parse the TYPE_INFO grammar defined by MS-SSTDS for TDS 4.2.
+    ///
+    /// In particular, legacy TEXT/IMAGE metadata has a four-byte maximum
+    /// length but no five-byte collation. Accepting modern-only type IDs here
+    /// would desynchronize the remainder of an RPC request.
+    pub fn type_info_legacy42(&mut self) -> Result<TypeInfo> {
+        let id = self.u8()?;
+        if !matches!(
+            id,
+            0x1f | 0x22
+                | 0x23
+                | 0x24
+                | 0x25
+                | 0x26
+                | 0x27
+                | 0x2d
+                | 0x2f
+                | 0x30
+                | 0x32
+                | 0x34
+                | 0x37
+                | 0x38
+                | 0x3a
+                | 0x3b
+                | 0x3c
+                | 0x3d
+                | 0x3e
+                | 0x3f
+                | 0x68
+                | 0x6a
+                | 0x6c
+                | 0x6d
+                | 0x6e
+                | 0x6f
+                | 0x7a
+                | 0x7f
+        ) {
+            return Err(Error::Protocol(format!(
+                "unknown TDS 4.2 TYPE_INFO 0x{id:02x}"
+            )));
+        }
+        if matches!(id, 0x22 | 0x23) {
+            return Ok(TypeInfo {
+                id,
+                name: type_name(id),
+                max_length: Some(u64::from(self.u32()?)),
+                precision: None,
+                scale: None,
+                collation: None,
+                kind: TypeKind::LongLength,
+            });
+        }
         self.type_info_after_id(id)
     }
 
@@ -331,12 +408,18 @@ impl<'a> Cursor<'a> {
             // marker. Value parsing accepts and validates both encodings.
             0xf4 => info.kind = TypeKind::Json,
             0xf5 => {
-                info.max_length = Some(u64::from(self.u16()?));
-                let scale = self.u8()?;
-                if !matches!(scale, 2 | 4) {
-                    return Err(Error::Protocol("invalid vector dimension width".into()));
+                let max_length = self.u16()?;
+                if max_length > 8000 {
+                    return Err(Error::Protocol(
+                        "vector maximum length exceeds 8000 bytes".into(),
+                    ));
                 }
-                info.scale = Some(scale);
+                info.max_length = Some(u64::from(max_length));
+                let dimension_type = self.u8()?;
+                // The value is independently USHORT-length framed. Preserve
+                // future dimension types as binary telemetry; validation of
+                // currently published types happens with the value header.
+                info.scale = Some(dimension_type);
                 info.kind = TypeKind::UShortLength;
             }
             _ => return Err(Error::Protocol(format!("unknown TDS TYPE_INFO 0x{id:02x}"))),
@@ -533,6 +616,7 @@ impl<'a> Cursor<'a> {
 
     fn tvp_value(&mut self, info: &TvpInfo) -> Result<Value> {
         let mut rows = 0usize;
+        let mut sampled_rows = Vec::new();
         loop {
             match self.u8()? {
                 0x00 => break,
@@ -541,11 +625,20 @@ impl<'a> Cursor<'a> {
                     if rows > 1_000_000 {
                         return Err(Error::Limit("TVP row count"));
                     }
+                    let mut sampled = (sampled_rows.len() < 10).then(Vec::new);
                     for &index in &info.row_order {
                         let column = &info.columns[index];
                         if column.flags & 0x0200 == 0 {
-                            let _ = self.value(&column.ty)?;
+                            let value = self.value(&column.ty)?;
+                            if let Some(row) = &mut sampled {
+                                row.push(value.telemetry_value());
+                            }
+                        } else if let Some(row) = &mut sampled {
+                            row.push("<default>".into());
                         }
+                    }
+                    if let Some(row) = sampled {
+                        sampled_rows.push(row);
                     }
                 }
                 token => {
@@ -558,6 +651,7 @@ impl<'a> Cursor<'a> {
         Ok(Value::Table {
             columns: info.columns.len(),
             rows,
+            sampled_rows,
         })
     }
 
@@ -598,6 +692,9 @@ impl<'a> Cursor<'a> {
 
     fn decode(&self, ty: &TypeInfo, bytes: Vec<u8>) -> Result<Value> {
         validate_value_width(ty, bytes.len())?;
+        if ty.id == 0xf5 {
+            validate_vector(ty, &bytes)?;
+        }
         Ok(match ty.id {
             0x1f => Value::Null,
             0x30 => Value::Integer(i64::from(bytes[0])),
@@ -837,7 +934,7 @@ fn validate_value_width(ty: &TypeInfo, len: usize) -> Result<()> {
         0x37 | 0x3f | 0x6a | 0x6c => matches!(len, 5 | 9 | 13 | 17),
         0x68 => len == 1,
         0x6d..=0x6f => matches!(len, 4 | 8),
-        0xf5 => ty.scale.is_some_and(|width| len % usize::from(width) == 0),
+        0xf5 => (8..=8000).contains(&len),
         _ => true,
     };
     if valid {
@@ -848,6 +945,46 @@ fn validate_value_width(ty: &TypeInfo, len: usize) -> Result<()> {
             ty.name
         )))
     }
+}
+
+fn validate_vector(ty: &TypeInfo, bytes: &[u8]) -> Result<()> {
+    let header: &[u8; 8] = bytes
+        .get(..8)
+        .and_then(|header| header.try_into().ok())
+        .ok_or_else(|| Error::Protocol("truncated vector header".into()))?;
+    if header[0] != 0xa9 {
+        return Err(Error::Protocol("invalid vector layout format".into()));
+    }
+    if header[1] != 0x01 {
+        // A future layout remains safely bounded by TYPE_VARBYTE. Do not let
+        // an unknown semantic layout hide later RPC parameters or bulk rows.
+        return Ok(());
+    }
+    let dimensions = usize::from(u16::from_le_bytes([header[2], header[3]]));
+    let dimension_type = header[4];
+    if ty.scale != Some(dimension_type) {
+        return Err(Error::Protocol(
+            "vector TYPE_INFO and value dimension types differ".into(),
+        ));
+    }
+    let width = match dimension_type {
+        0 => 4,
+        1 => 2,
+        // Future dimension types are length-delimited but cannot yet be
+        // validated semantically. Their complete bytes remain available.
+        _ => return Ok(()),
+    };
+    let expected = dimensions
+        .checked_mul(width)
+        .and_then(|data| data.checked_add(8))
+        .ok_or(Error::Limit("vector dimensions"))?;
+    if bytes.len() != expected {
+        return Err(Error::Protocol(format!(
+            "vector dimension count requires {expected} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(())
 }
 
 fn time_width(scale: Option<u8>) -> Option<usize> {
@@ -935,17 +1072,113 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_published_ms_tds_type_info_family_has_a_fixture() {
+        let fixed = [
+            0x1f, 0x30, 0x32, 0x34, 0x38, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x7a, 0x7f,
+        ];
+        for id in fixed {
+            let raw = [id];
+            let mut cursor = Cursor::new(&raw, 1024, "fixed TYPE_INFO coverage");
+            assert_eq!(cursor.type_info().unwrap().id, id);
+            assert!(cursor.done());
+        }
+
+        let cases: Vec<(u8, Vec<u8>)> = vec![
+            (0x24, vec![16]),
+            (0x25, vec![8]),
+            (0x26, vec![8]),
+            (0x27, vec![8]),
+            (0x28, vec![]),
+            (0x29, vec![7]),
+            (0x2a, vec![7]),
+            (0x2b, vec![7]),
+            (0x2d, vec![8]),
+            (0x2f, vec![8]),
+            (0x37, vec![17, 38, 10]),
+            (0x3f, vec![17, 38, 10]),
+            (0x68, vec![1]),
+            (0x6a, vec![17, 38, 10]),
+            (0x6c, vec![17, 38, 10]),
+            (0x6d, vec![8]),
+            (0x6e, vec![8]),
+            (0x6f, vec![8]),
+            (0xa5, vec![8, 0]),
+            (0xad, vec![8, 0]),
+            (0xa7, vec![8, 0, 0, 0, 0, 0, 0]),
+            (0xaf, vec![8, 0, 0, 0, 0, 0, 0]),
+            (0xe7, vec![8, 0, 0, 0, 0, 0, 0]),
+            (0xef, vec![8, 0, 0, 0, 0, 0, 0]),
+            (0x22, vec![8, 0, 0, 0]),
+            (0x23, vec![8, 0, 0, 0, 0, 0, 0, 0, 0]),
+            (0x63, vec![8, 0, 0, 0, 0, 0, 0, 0, 0]),
+            (0x62, vec![0x49, 0x1f, 0, 0]),
+            // UDT_INFO: max, empty db/schema/type/assembly.
+            (0xf0, vec![0xff, 0xff, 0, 0, 0, 0, 0]),
+            // XML_INFO without schema.
+            (0xf1, vec![0]),
+            // Empty TVP type metadata and metadata terminator.
+            (0xf3, vec![0, 0, 0, 0xff, 0xff, 0]),
+            (0xf4, vec![]),
+            (0xf5, vec![0x40, 0x1f, 0]),
+        ];
+        for (id, metadata) in cases {
+            let mut raw = vec![id];
+            raw.extend_from_slice(&metadata);
+            let mut cursor = Cursor::new(&raw, 1024, "variable TYPE_INFO coverage");
+            assert_eq!(cursor.type_info().unwrap().id, id, "type 0x{id:02x}");
+            assert!(cursor.done(), "type 0x{id:02x}");
+        }
+    }
+
+    #[test]
     fn vector_uses_ushort_length_and_dimension_scale() {
-        let raw = [0xf5, 12, 0, 4, 12, 0, 0xa9, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let raw = [0xf5, 12, 0, 0, 12, 0, 0xa9, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let mut cursor = Cursor::new(&raw, 1024, "test vector");
         let ty = cursor.type_info().unwrap();
         assert_eq!(ty.max_length, Some(12));
-        assert_eq!(ty.scale, Some(4));
+        assert_eq!(ty.scale, Some(0));
         assert_eq!(
             cursor.value(&ty).unwrap().telemetry_value(),
             "<binary:12 bytes>"
         );
         assert!(cursor.done());
+    }
+
+    #[test]
+    fn vector_validates_header_type_and_dimension_count() {
+        let cases = [
+            vec![0xf5, 12, 0, 0, 12, 0, 0xa8, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            vec![0xf5, 12, 0, 0, 12, 0, 0xa9, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+            vec![0xf5, 12, 0, 0, 12, 0, 0xa9, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ];
+        for raw in cases {
+            let mut cursor = Cursor::new(&raw, 1024, "test vector");
+            let ty = cursor.type_info().unwrap();
+            assert!(cursor.value(&ty).is_err());
+        }
+
+        let raw = [0xf5, 10, 0, 1, 10, 0, 0xa9, 1, 1, 0, 1, 7, 8, 9, 0, 0];
+        let mut cursor = Cursor::new(&raw, 1024, "test vector");
+        let ty = cursor.type_info().unwrap();
+        assert_eq!(ty.scale, Some(1));
+        assert!(cursor.value(&ty).is_ok());
+        assert!(cursor.done());
+    }
+
+    #[test]
+    fn vector_preserves_future_length_delimited_layouts_as_binary() {
+        for raw in [
+            vec![0xf5, 12, 0, 0, 12, 0, 0xa9, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            vec![0xf5, 12, 0, 2, 12, 0, 0xa9, 1, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0],
+        ] {
+            let mut cursor = Cursor::new(&raw, 1024, "future vector");
+            let ty = cursor.type_info().unwrap();
+            assert_eq!(
+                cursor.value(&ty).unwrap().telemetry_value(),
+                "<binary:12 bytes>"
+            );
+            assert!(cursor.done());
+        }
     }
 
     #[test]
@@ -1001,7 +1234,7 @@ mod tests {
         let ty = cursor.type_info().unwrap();
         assert_eq!(
             cursor.value(&ty).unwrap().telemetry_value(),
-            "<table:2 columns:1 rows>"
+            "<table:2 columns:1 rows sample:[[\"N'sql'\",\"42\"]]>"
         );
         assert!(cursor.done());
     }
