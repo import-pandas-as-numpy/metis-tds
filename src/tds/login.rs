@@ -1,6 +1,6 @@
 use crate::{Error, Result};
 
-use super::login7::LoginRequest;
+use super::login7::{LegacyLoginDetails, LoginRequest};
 
 const MIN_LENGTH: usize = 564;
 
@@ -41,6 +41,15 @@ fn parse_inner(payload: &[u8], tolerant: bool) -> Result<LoginRequest> {
         tolerant,
         &mut warnings,
     )?;
+    let host_process = recover_field(
+        payload,
+        93,
+        30,
+        123,
+        "host process",
+        tolerant,
+        &mut warnings,
+    )?;
     let client_library = recover_field(
         payload,
         462,
@@ -51,6 +60,15 @@ fn parse_inner(payload: &[u8], tolerant: bool) -> Result<LoginRequest> {
         &mut warnings,
     )?;
     let language = recover_field(payload, 480, 30, 510, "language", tolerant, &mut warnings)?;
+    let client_charset = recover_field(
+        payload,
+        525,
+        30,
+        555,
+        "character set",
+        tolerant,
+        &mut warnings,
+    )?;
     let packet_size_text =
         recover_field(payload, 557, 6, 563, "packet size", tolerant, &mut warnings)?;
     let packet_size = if packet_size_text.is_empty() {
@@ -70,19 +88,50 @@ fn parse_inner(payload: &[u8], tolerant: bool) -> Result<LoginRequest> {
         }
     };
     let tds_version = u32::from_be_bytes(payload[458..462].try_into().expect("fixed length"));
-    let remote_password = if tds_version >> 24 == 0x04 && tds_version >> 16 & 0xff == 0x02 {
-        recover_field(
-            payload,
-            202,
-            255,
-            457,
-            "remote password",
-            tolerant,
-            &mut warnings,
-        )?
-    } else {
-        recover_tds5_remote_password(payload, tolerant, &mut warnings)?
+    let fixed_record_expected_bytes = match tds_version >> 16 {
+        0x0402 => 572,
+        0x0406 | 0x0500..=0x05ff => 568,
+        _ => MIN_LENGTH,
     };
+    if payload.len() < fixed_record_expected_bytes {
+        let error = Error::Protocol(format!(
+            "legacy LOGIN record for version 0x{tds_version:08x} must be at least {fixed_record_expected_bytes} bytes"
+        ));
+        if tolerant {
+            warnings.push(error.to_string());
+        } else {
+            return Err(error);
+        }
+    }
+    if tds_version >> 24 == 0x04 && payload.len() > 572 {
+        let error = Error::Protocol("TDS 4.x LOGIN record exceeds 572 bytes".into());
+        if tolerant {
+            warnings.push(error.to_string());
+        } else {
+            return Err(error);
+        }
+    }
+    let (remote_password, remote_password_encoding) =
+        if tds_version >> 24 == 0x04 && tds_version >> 16 & 0xff == 0x02 {
+            (
+                recover_field(
+                    payload,
+                    202,
+                    255,
+                    457,
+                    "remote password",
+                    tolerant,
+                    &mut warnings,
+                )?,
+                "tds42_fixed_255",
+            )
+        } else {
+            (
+                recover_tds5_remote_password(payload, tolerant, &mut warnings)?,
+                "tds46_tds50_length_prefixed",
+            )
+        };
+    let remote_password_present = !remote_password.is_empty();
     let password = if primary_password.is_empty() {
         remote_password
     } else {
@@ -91,7 +140,7 @@ fn parse_inner(payload: &[u8], tolerant: bool) -> Result<LoginRequest> {
     let security_flags = payload[514];
     let integrated_security = security_flags & 0x10 != 0;
     let password_present = !password.is_empty();
-    let (capabilities_bytes, authentication_bytes) =
+    let (capabilities_bytes, capabilities, authentication_bytes, authentication) =
         parse_suffix(payload, tds_version, tolerant, &mut warnings)?;
 
     Ok(LoginRequest {
@@ -115,8 +164,35 @@ fn parse_inner(payload: &[u8], tolerant: bool) -> Result<LoginRequest> {
         sspi_token_family: None,
         parse_warnings: warnings,
         legacy_security_flags: Some(security_flags),
+        legacy_login: Some(LegacyLoginDetails {
+            host_process,
+            client_charset,
+            client_program_version: u32::from_be_bytes(
+                payload[473..477].try_into().expect("fixed length"),
+            ),
+            bulk_copy_raw: payload[130],
+            bulk_copy_requested: payload[130] == 0,
+            suppress_language_raw: payload[511],
+            old_secure: payload[512..514].try_into().expect("fixed length"),
+            security_bulk_raw: payload[515],
+            ha_login_raw: payload[516],
+            ha_session_id: payload[517..523].try_into().expect("fixed length"),
+            security_spare: payload[523..525].try_into().expect("fixed length"),
+            set_charset_raw: payload[556],
+            fixed_record_expected_bytes,
+            fixed_record_present_bytes: payload.len().min(fixed_record_expected_bytes),
+            fixed_padding: payload
+                .get(564..payload.len().min(fixed_record_expected_bytes))
+                .unwrap_or_default()
+                .to_vec(),
+            suffix_bytes: payload.len().saturating_sub(fixed_record_expected_bytes),
+            remote_password_encoding,
+            remote_password_present,
+        }),
         legacy_capabilities_bytes: capabilities_bytes,
+        legacy_capabilities: capabilities,
         legacy_authentication_bytes: authentication_bytes,
+        legacy_authentication: authentication,
         ..LoginRequest::default()
     })
 }
@@ -163,15 +239,26 @@ fn parse_suffix(
     tds_version: u32,
     tolerant: bool,
     warnings: &mut Vec<String>,
-) -> Result<(usize, usize)> {
+) -> Result<(
+    usize,
+    Option<super::tds5::Capabilities>,
+    usize,
+    Option<super::tds5::AuthenticationStream>,
+)> {
     if tds_version >> 24 != 0x05 || payload.len() <= 568 {
-        return Ok((0, payload.len().saturating_sub(572)));
+        return Ok((0, None, payload.len().saturating_sub(572), None));
     }
     if payload.len() < 571 {
         let error = Error::Protocol("truncated TDS 5.0 capability header".into());
         return if tolerant {
             warnings.push(error.to_string());
-            Ok((0, payload.len() - 568))
+            let suffix = &payload[568..];
+            Ok((
+                0,
+                None,
+                suffix.len(),
+                recover_suffix_authentication(suffix, payload.len()),
+            ))
         } else {
             Err(error)
         };
@@ -180,7 +267,13 @@ fn parse_suffix(
         let error = Error::Protocol("TDS 5.0 LOGIN suffix does not start with CAPABILITY".into());
         return if tolerant {
             warnings.push(error.to_string());
-            Ok((0, payload.len() - 568))
+            let suffix = &payload[568..];
+            Ok((
+                0,
+                None,
+                suffix.len(),
+                recover_suffix_authentication(suffix, payload.len()),
+            ))
         } else {
             Err(error)
         };
@@ -193,12 +286,49 @@ fn parse_suffix(
         let error = Error::Protocol("truncated TDS 5.0 capability token".into());
         return if tolerant {
             warnings.push(error.to_string());
-            Ok((payload.len().saturating_sub(571), 0))
+            let suffix = &payload[568..];
+            Ok((
+                payload.len().saturating_sub(571),
+                None,
+                suffix.len(),
+                recover_suffix_authentication(suffix, payload.len()),
+            ))
         } else {
             Err(error)
         };
     }
-    Ok((length, payload.len() - end))
+    let capabilities = match super::tds5::parse_capabilities(&payload[571..end]) {
+        Ok(value) => Some(value),
+        Err(error) if tolerant => {
+            warnings.push(error.to_string());
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let authentication_bytes = payload.len() - end;
+    let authentication = if authentication_bytes == 0 {
+        None
+    } else {
+        match super::tds5::parse_authentication(&payload[end..], payload.len()) {
+            Ok(value) => Some(value),
+            Err(error) if tolerant => {
+                warnings.push(error.to_string());
+                Some(super::tds5::parse_for_telemetry(
+                    &payload[end..],
+                    payload.len(),
+                ))
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    Ok((length, capabilities, authentication_bytes, authentication))
+}
+
+fn recover_suffix_authentication(
+    suffix: &[u8],
+    max_value_bytes: usize,
+) -> Option<super::tds5::AuthenticationStream> {
+    (!suffix.is_empty()).then(|| super::tds5::parse_for_telemetry(suffix, max_value_bytes))
 }
 
 fn field(
@@ -223,7 +353,15 @@ mod tests {
 
     #[test]
     fn parses_fixed_width_sql_auth_fields() {
-        let payload = login("scan-host", "sa", "gold", "pymssql", "203.0.113.10:1433");
+        let mut payload = login("scan-host", "sa", "gold", "pymssql", "203.0.113.10:1433");
+        put(&mut payload, 93, 123, "4242");
+        put(&mut payload, 525, 555, "iso_1");
+        payload[130] = 0;
+        payload[473..477].copy_from_slice(&0x0402_0102_u32.to_be_bytes());
+        payload[511] = 1;
+        payload[515] = 1;
+        payload[516] = 2;
+        payload[517..523].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
         let parsed = parse(&payload).unwrap();
         assert_eq!(parsed.client_hostname, "scan-host");
         assert_eq!(parsed.username, "sa");
@@ -235,6 +373,20 @@ mod tests {
         assert_eq!(parsed.packet_size, 4096);
         assert_eq!(parsed.tds_version, 0x0402_0000);
         assert!(!parsed.integrated_security);
+        let legacy = parsed.legacy_login.unwrap();
+        assert_eq!(legacy.host_process, "4242");
+        assert_eq!(legacy.client_charset, "iso_1");
+        assert_eq!(legacy.client_program_version, 0x0402_0102);
+        assert!(legacy.bulk_copy_requested);
+        assert_eq!(legacy.suppress_language_raw, 1);
+        assert_eq!(legacy.security_bulk_raw, 1);
+        assert_eq!(legacy.ha_login_raw, 2);
+        assert_eq!(legacy.ha_session_id, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(legacy.fixed_record_expected_bytes, 572);
+        assert_eq!(legacy.fixed_record_present_bytes, 572);
+        assert_eq!(legacy.fixed_padding.len(), 8);
+        assert_eq!(legacy.remote_password_encoding, "tds42_fixed_255");
+        assert!(!legacy.remote_password_present);
     }
 
     #[test]
@@ -243,6 +395,40 @@ mod tests {
         payload[61] = 31;
         assert!(parse(&payload).is_err());
         assert!(parse(&payload[..563]).is_err());
+    }
+
+    #[test]
+    fn enforces_tds42_record_limit_without_losing_telemetry() {
+        let mut payload = login("host", "sa", "gold", "pymssql", "server");
+        payload.push(0);
+        assert!(parse(&payload).is_err());
+        let parsed = parse_for_telemetry(&payload).unwrap();
+        assert_eq!(parsed.username, "sa");
+        assert_eq!(parsed.password_for_capture(), Some("gold"));
+        assert!(!parsed.parse_warnings.is_empty());
+    }
+
+    #[test]
+    fn enforces_versioned_fixed_record_minimums_without_losing_fields() {
+        let mut tds42 = login("host", "sa", "gold", "pymssql", "server");
+        tds42.truncate(568);
+        assert!(parse(&tds42).is_err());
+        let recovered = parse_for_telemetry(&tds42).unwrap();
+        assert_eq!(recovered.username, "sa");
+        assert_eq!(recovered.password_for_capture(), Some("gold"));
+        assert_eq!(
+            recovered.legacy_login.unwrap().fixed_record_expected_bytes,
+            572
+        );
+        assert!(!recovered.parse_warnings.is_empty());
+
+        let mut tds46 = tds42;
+        tds46[458..462].copy_from_slice(&0x0406_0000_u32.to_be_bytes());
+        let parsed = parse(&tds46).unwrap();
+        assert_eq!(
+            parsed.legacy_login.unwrap().fixed_record_expected_bytes,
+            568
+        );
     }
 
     fn login(host: &str, user: &str, password: &str, app: &str, server: &str) -> Vec<u8> {
@@ -267,14 +453,52 @@ mod tests {
         payload[458..462].copy_from_slice(&0x0500_0000_u32.to_be_bytes());
         payload[514] = 0x10;
         payload.push(0xe2);
-        payload.extend_from_slice(&32_u16.to_le_bytes());
-        payload.extend_from_slice(&[7; 32]);
-        payload.extend_from_slice(b"gss-continuation");
+        let capabilities = [
+            1, 7, 7, 97, 65, 207, 255, 255, 230, 2, 7, 0, 0, 2, 0, 0, 0, 0,
+        ];
+        payload.extend_from_slice(&(capabilities.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&capabilities);
+        payload.extend_from_slice(&[0x65, 3, 0, 11, 0]);
         let parsed = parse(&payload).unwrap();
         assert!(parsed.integrated_security);
         assert_eq!(parsed.legacy_security_flags, Some(0x10));
-        assert_eq!(parsed.legacy_capabilities_bytes, 32);
-        assert_eq!(parsed.legacy_authentication_bytes, 16);
+        assert_eq!(parsed.legacy_capabilities_bytes, 18);
+        assert_eq!(
+            parsed.legacy_capabilities.unwrap().request,
+            [7, 97, 65, 207, 255, 255, 230]
+        );
+        assert_eq!(parsed.legacy_authentication_bytes, 5);
+        assert_eq!(
+            parsed.legacy_authentication.unwrap().message_types[0].name,
+            "opaque_security"
+        );
+    }
+
+    #[test]
+    fn telemetry_recovers_tds5_authentication_when_capability_framing_is_missing() {
+        let mut payload = login("scan-host", "sa", "", "isql", "SYBASE");
+        payload.truncate(568);
+        payload[458..462].copy_from_slice(&0x0500_0000_u32.to_be_bytes());
+        payload.extend_from_slice(&[0x19, 0xde, 0xad]); // proprietary/unknown prefix
+        payload.extend_from_slice(&[0x65, 3, 1, 31, 0]);
+        payload.extend_from_slice(&[
+            0xec, 0x0e, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xe1, 0xff, 0xff, 0xff, 0x7f, 0,
+        ]);
+        payload.extend_from_slice(&[0xd7, 4, 0, 0, 0, 1, 2, 3, 4]);
+
+        assert!(parse(&payload).is_err());
+        let parsed = parse_for_telemetry(&payload).unwrap();
+        let authentication = parsed.legacy_authentication.unwrap();
+        assert_eq!(authentication.message_types[0].message_type, 31);
+        assert_eq!(authentication.encrypted_login_password_bytes, Some(4));
+        assert_eq!(authentication.unparsed_regions[0].bytes, 3);
+        assert_eq!(parsed.legacy_authentication_bytes, payload.len() - 568);
+        assert!(
+            parsed
+                .parse_warnings
+                .iter()
+                .any(|warning| warning.contains("CAPABILITY"))
+        );
     }
 
     fn put(payload: &mut [u8], offset: usize, length_offset: usize, value: &str) {

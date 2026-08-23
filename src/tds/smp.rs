@@ -6,6 +6,7 @@ pub const HEADER_LEN: usize = 16;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Frame {
+    pub offset: usize,
     pub flag: u8,
     pub flag_name: &'static str,
     pub session_id: u16,
@@ -58,6 +59,7 @@ pub fn parse(input: &[u8], max_frame: usize) -> Result<Vec<Frame>> {
             .get(position..end)
             .ok_or_else(|| Error::Protocol("truncated SMP frame".into()))?;
         frames.push(Frame {
+            offset: position,
             flag,
             flag_name,
             session_id,

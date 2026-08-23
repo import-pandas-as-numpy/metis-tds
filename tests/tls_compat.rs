@@ -12,10 +12,11 @@ use metis_tds::{
 };
 use rustls::{
     ClientConfig as RustlsClientConfig, RootCertStore,
-    pki_types::{CertificateDer, ServerName},
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName},
 };
 use serde_json::Value;
 use tiberius::{AuthMethod, Config as ClientConfig, EncryptionLevel};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
@@ -233,6 +234,129 @@ async fn tiberius_negotiates_tds_wrapped_tls_and_queries() {
     server_task.abort();
 }
 
+#[tokio::test]
+async fn tiberius_negotiates_login_only_tls_when_encryption_is_off() {
+    let temp = tempfile::tempdir().unwrap();
+    let key_pem = temp.path().join("key.pem");
+    let cert_pem = temp.path().join("cert.pem");
+    let key_der = temp.path().join("key.der");
+    let cert_der = temp.path().join("cert.der");
+    let telemetry_path = temp.path().join("events.jsonl");
+    openssl(&[
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-keyout",
+        key_pem.to_str().unwrap(),
+        "-out",
+        cert_pem.to_str().unwrap(),
+        "-days",
+        "1",
+        "-nodes",
+        "-subj",
+        "/CN=localhost",
+    ]);
+    openssl(&[
+        "x509",
+        "-in",
+        cert_pem.to_str().unwrap(),
+        "-outform",
+        "DER",
+        "-out",
+        cert_der.to_str().unwrap(),
+    ]);
+    openssl(&[
+        "pkcs8",
+        "-topk8",
+        "-inform",
+        "PEM",
+        "-outform",
+        "DER",
+        "-in",
+        key_pem.to_str().unwrap(),
+        "-nocrypt",
+        "-out",
+        key_der.to_str().unwrap(),
+    ]);
+
+    let mut server_config = ServerConfig::default();
+    server_config.listener.address = "127.0.0.1:0".into();
+    server_config.telemetry.jsonl_path = Some(telemetry_path.to_string_lossy().into_owned());
+    server_config.telemetry.stdout = false;
+    server_config.telemetry.capture_login_passwords = true;
+    server_config.tls.mode = TlsMode::Optional;
+    server_config.tls.certificate_der = Some(cert_der.to_string_lossy().into_owned());
+    server_config.tls.private_key_der = Some(key_der.to_string_lossy().into_owned());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(
+        Server::new(server_config)
+            .await
+            .unwrap()
+            .serve(listener, false),
+    );
+
+    let mut client_config = ClientConfig::new();
+    client_config.host("localhost");
+    client_config.port(address.port());
+    client_config.database("master");
+    client_config.authentication(AuthMethod::sql_server(
+        "login-only-client",
+        "captured-before-downgrade",
+    ));
+    client_config.encryption(EncryptionLevel::Off);
+    client_config.trust_cert();
+    let tcp = TcpStream::connect(address).await.unwrap();
+    let mut client = tiberius::Client::connect(client_config, tcp.compat_write())
+        .await
+        .unwrap();
+    let rows = client
+        .simple_query("SELECT @@SERVERNAME")
+        .await
+        .unwrap()
+        .into_first_result()
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<&str, _>(0), Some("SQL-FIN-01"));
+
+    let mut completed = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let events: Vec<Value> = std::fs::read_to_string(&telemetry_path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if events.iter().any(|event| {
+            event["event_type"] == "login_attempt" && event["username"] == "login-only-client"
+        }) {
+            completed = Some(events);
+            break;
+        }
+    }
+    let events = completed.expect("login-only TLS authentication telemetry");
+    assert!(events.iter().any(|event| {
+        event["event_type"] == "prelogin"
+            && event["encryption_request"] == "off"
+            && event["encryption_response"] == "off"
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event_type"] == "tls_login_only")
+    );
+    let login = events
+        .iter()
+        .find(|event| {
+            event["event_type"] == "login_attempt" && event["username"] == "login-only-client"
+        })
+        .expect("login-only LOGIN7 credential capture");
+    assert_eq!(login["password"], "captured-before-downgrade");
+    assert_eq!(login["transport"], "tds7_login_only_tls");
+    server_task.abort();
+}
+
 fn openssl(arguments: &[&str]) {
     let output = Command::new("openssl").args(arguments).output().unwrap();
     assert!(
@@ -250,6 +374,7 @@ async fn tds8_raw_tls_precedes_prelogin_and_login7() {
     let key_der = temp.path().join("key.der");
     let cert_der = temp.path().join("cert.der");
     let telemetry_path = temp.path().join("events.jsonl");
+    let payload_directory = temp.path().join("payloads");
     openssl(&[
         "req",
         "-x509",
@@ -296,6 +421,10 @@ async fn tds8_raw_tls_precedes_prelogin_and_login7() {
     server_config.listener.address = "127.0.0.1:0".into();
     server_config.telemetry.jsonl_path = Some(telemetry_path.to_string_lossy().into_owned());
     server_config.telemetry.stdout = false;
+    server_config.telemetry.capture_login_passwords = true;
+    server_config.payloads.enabled = true;
+    server_config.payloads.capture_login_messages = true;
+    server_config.payloads.directory = payload_directory.to_string_lossy().into_owned();
     server_config.tls.mode = TlsMode::Required;
     server_config.tls.certificate_der = Some(cert_der.to_string_lossy().into_owned());
     server_config.tls.private_key_der = Some(key_der.to_string_lossy().into_owned());
@@ -312,9 +441,12 @@ async fn tds8_raw_tls_precedes_prelogin_and_login7() {
     roots
         .add(CertificateDer::from(std::fs::read(&cert_der).unwrap()))
         .unwrap();
+    let client_certificate = CertificateDer::from(std::fs::read(&cert_der).unwrap());
+    let client_key = PrivateKeyDer::try_from(std::fs::read(&key_der).unwrap()).unwrap();
     let mut client_config = RustlsClientConfig::builder()
         .with_root_certificates(roots)
-        .with_no_client_auth();
+        .with_client_auth_cert(vec![client_certificate], client_key)
+        .unwrap();
     client_config.alpn_protocols = vec![b"tds/8.0".to_vec()];
     let connector = TlsConnector::from(std::sync::Arc::new(client_config));
     let tcp = TcpStream::connect(address).await.unwrap();
@@ -350,6 +482,40 @@ async fn tds8_raw_tls_precedes_prelogin_and_login7() {
     let login_response = read_message(&mut tls, 4096, 65_536).await.unwrap();
     assert!(login_response.payload.contains(&0xad));
 
+    // An out-of-order TLS-first client can skip PRELOGIN. It remains invalid
+    // protocol sequencing, but its already-decrypted LOGIN7 must still reach
+    // the normal credential parser instead of becoming only an opaque blob.
+    let tcp = TcpStream::connect(address).await.unwrap();
+    let mut skipped_prelogin = connector
+        .connect(ServerName::try_from("localhost").unwrap().to_owned(), tcp)
+        .await
+        .unwrap();
+    write_message(
+        &mut skipped_prelogin,
+        tds::LOGIN7,
+        &login7(
+            "prelogin-skipping-client",
+            "exposed-before-prelogin",
+            "raw-tds8-probe",
+        ),
+        4096,
+    )
+    .await
+    .unwrap();
+    let skipped_response = read_message(&mut skipped_prelogin, 4096, 65_536)
+        .await
+        .unwrap();
+    assert!(skipped_response.payload.contains(&0xad));
+
+    let tcp = TcpStream::connect(address).await.unwrap();
+    let mut truncated_login = connector
+        .connect(ServerName::try_from("localhost").unwrap().to_owned(), tcp)
+        .await
+        .unwrap();
+    let truncated_wire = [tds::LOGIN7, 0x01, 0, 32, 0, 0, 1, 0, 1, 2, 3, 4];
+    truncated_login.write_all(&truncated_wire).await.unwrap();
+    truncated_login.shutdown().await.unwrap();
+
     tokio::time::sleep(Duration::from_millis(50)).await;
     let events: Vec<Value> = std::fs::read_to_string(&telemetry_path)
         .unwrap_or_default()
@@ -360,7 +526,26 @@ async fn tds8_raw_tls_precedes_prelogin_and_login7() {
         event["event_type"] == "tls_negotiated"
             && event["transport"] == "tds8"
             && event["alpn_protocol"] == "tds/8.0"
+            && event["client_certificate_count"] == 1
+            && event["client_certificate_sha256"][0]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64)
     }));
+    let incomplete = events
+        .iter()
+        .find(|event| {
+            event["event_type"] == "incomplete_authentication_message_capture"
+                && event["transport"] == "tds8"
+                && event["packet_type"] == tds::LOGIN7
+        })
+        .expect("truncated pre-PRELOGIN LOGIN7 capture");
+    assert_eq!(incomplete["wire_format"], "tds_packets_with_headers");
+    assert_eq!(incomplete["size"], truncated_wire.len());
+    let stored = payload_directory.join(format!(
+        "{}.bin",
+        incomplete["storage_id"].as_str().unwrap()
+    ));
+    assert_eq!(std::fs::read(stored).unwrap(), truncated_wire);
     assert!(
         events
             .iter()
@@ -368,6 +553,16 @@ async fn tds8_raw_tls_precedes_prelogin_and_login7() {
     );
     assert!(events.iter().any(|event| {
         event["event_type"] == "login_attempt" && event["username"] == "strict-client"
+    }));
+    assert!(events.iter().any(|event| {
+        event["event_type"] == "authentication_before_tds8_prelogin"
+            && event["packet_type"] == tds::LOGIN7
+    }));
+    assert!(events.iter().any(|event| {
+        event["event_type"] == "login_attempt"
+            && event["transport"] == "tds8"
+            && event["username"] == "prelogin-skipping-client"
+            && event["password"] == "exposed-before-prelogin"
     }));
     server_task.abort();
 }

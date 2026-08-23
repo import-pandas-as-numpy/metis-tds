@@ -110,10 +110,10 @@ pub fn parse_for_version(
                     "trace-activity header requires TDS 7.4 or later".into(),
                 ));
             }
-            1..=3 => {}
-            value => {
-                return Err(Error::Protocol(format!("unknown ALL_HEADERS type {value}")));
-            }
+            // Future header types remain structurally self-delimiting. Keep
+            // their byte counts in telemetry instead of making a newer client
+            // opaque at the start of an otherwise valid request.
+            _ => {}
         }
     }
     Ok((headers, body))

@@ -57,6 +57,7 @@ fuzz_target!(|data: &[u8]| {
             "us_english",
             4096,
             &error.message,
+            &[],
         );
         let _ = tokens::login_failure(protocol, "METIS", data.len() % 2 == 0);
     }

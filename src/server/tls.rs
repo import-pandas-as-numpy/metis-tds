@@ -1,4 +1,5 @@
 use std::{
+    fmt::Debug,
     io,
     path::Path,
     pin::Pin,
@@ -7,12 +8,15 @@ use std::{
 };
 
 use rustls::{
-    ServerConfig,
-    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    DigitallySignedStruct, DistinguishedName, Error as RustlsError, ServerConfig, SignatureScheme,
+    client::danger::HandshakeSignatureValid,
+    crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature},
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime},
+    server::danger::{ClientCertVerified, ClientCertVerifier},
 };
 use tokio::{
     fs,
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
@@ -21,7 +25,7 @@ use crate::{Error, Result, config::TlsConfig};
 const HEADER_LEN: usize = 8;
 const HANDSHAKE_PACKET_SIZE: usize = 16_384;
 
-pub async fn acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
+pub async fn acceptor(config: &TlsConfig, request_client_certificate: bool) -> Result<TlsAcceptor> {
     let certificate_path = config
         .certificate_der
         .as_deref()
@@ -32,15 +36,96 @@ pub async fn acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
         .ok_or_else(|| Error::Config("missing TLS private key DER".into()))?;
     let certificate = read_bounded(certificate_path, 1024 * 1024).await?;
     let key = read_bounded(key_path, 1024 * 1024).await?;
-    let mut server = ServerConfig::builder()
-        .with_no_client_auth()
+    let builder = ServerConfig::builder();
+    let builder = if request_client_certificate {
+        builder.with_client_cert_verifier(CaptureAnyClientCertificate::new())
+    } else {
+        builder.with_no_client_auth()
+    };
+    let mut server = builder
         .with_single_cert(
             vec![CertificateDer::from(certificate)],
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
         )
         .map_err(|error| Error::Tls(error.to_string()))?;
+    // A TLS 1.3 NewSessionTicket is an application-data record on the wire.
+    // In TDS 7.x login-only encryption it would remain ahead of the plaintext
+    // login response after the TLS layer is removed, so clients would mistake
+    // byte 0x17 for a TDS packet type. Session resumption has no value for a
+    // honeypot and suppressing tickets keeps both full and login-only modes
+    // deterministic.
+    server.send_tls13_tickets = 0;
     server.alpn_protocols = vec![b"tds/8.0".to_vec()];
     Ok(TlsAcceptor::from(Arc::new(server)))
+}
+
+/// Requests a certificate without assigning it trust. A honeypot cannot know
+/// the private CA used by an arbitrary probe, but it can verify possession of
+/// the presented key during the TLS handshake and inventory the certificate.
+#[derive(Debug)]
+struct CaptureAnyClientCertificate {
+    provider: Arc<CryptoProvider>,
+}
+
+impl CaptureAnyClientCertificate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        })
+    }
+}
+
+impl ClientCertVerifier for CaptureAnyClientCertificate {
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> std::result::Result<ClientCertVerified, RustlsError> {
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 async fn read_bounded(path: impl AsRef<Path>, max: u64) -> Result<Vec<u8>> {
@@ -74,6 +159,91 @@ where
         .map_err(|error| Error::Tls(error.to_string()))?;
     tls.flush().await?;
     Ok(tls)
+}
+
+/// Decrypts exactly the first TDS packet after a TDS 7.x TLS handshake and
+/// then returns to the underlying plaintext transport. This is the wire mode
+/// negotiated by ENCRYPT_OFF: the first packet of the Login message is TLS
+/// protected, while every subsequent packet is plaintext.
+pub async fn finish_login_only<S>(
+    mut tls: TlsStream<TdsTlsIo<S>>,
+    max_packet: usize,
+) -> Result<PrefixedIo<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut header = [0_u8; HEADER_LEN];
+    tls.read_exact(&mut header).await?;
+    let decoded = crate::tds::packet::Header::decode(header, max_packet)?;
+    if !crate::tds::is_authentication_packet(decoded.packet_type) {
+        return Err(Error::Protocol(format!(
+            "login-only TLS protected unexpected packet type 0x{:02x}",
+            decoded.packet_type
+        )));
+    }
+    let mut first_packet = Vec::with_capacity(usize::from(decoded.length));
+    first_packet.extend_from_slice(&header);
+    first_packet.resize(usize::from(decoded.length), 0);
+    tls.read_exact(&mut first_packet[HEADER_LEN..]).await?;
+
+    // Do not send close_notify: the TLS session ends at the packet boundary by
+    // protocol definition and the same socket immediately resumes plaintext.
+    let (adapter, _session) = tls.into_inner();
+    Ok(PrefixedIo::new(first_packet, adapter.into_inner()))
+}
+
+/// Replays already-decoded bytes before continuing on the underlying stream.
+/// Writes always go directly to the underlying stream.
+pub struct PrefixedIo<S> {
+    inner: S,
+    prefix: Vec<u8>,
+    position: usize,
+}
+
+impl<S> PrefixedIo<S> {
+    fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self {
+            inner,
+            prefix,
+            position: 0,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PrefixedIo<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.position < self.prefix.len() {
+            let take = output
+                .remaining()
+                .min(self.prefix.len().saturating_sub(self.position));
+            output.put_slice(&self.prefix[self.position..self.position + take]);
+            self.position += take;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, output)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedIo<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, input)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// Adapts TLS handshake bytes to SQL Server's PRELOGIN packet encapsulation.
@@ -120,6 +290,10 @@ impl<S> TdsTlsIo<S> {
         self.read_payload_pos = 0;
         self.pending_write_pos = 0;
         self.accepted_write_len = 0;
+    }
+
+    fn into_inner(self) -> S {
+        self.inner
     }
 }
 

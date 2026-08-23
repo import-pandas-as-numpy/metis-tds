@@ -34,6 +34,7 @@ pub(crate) struct Shared {
     pub telemetry: Telemetry,
     pub payloads: PayloadStore,
     pub tls: Option<TlsAcceptor>,
+    pub client_cert_tls: Option<TlsAcceptor>,
     pub sessions: AtomicU32,
     pub metrics: Metrics,
     connection_limit: Arc<Semaphore>,
@@ -80,7 +81,12 @@ impl Server {
         let tls = if config.tls.mode == crate::config::TlsMode::Disabled {
             None
         } else {
-            Some(tls::acceptor(&config.tls).await?)
+            Some(tls::acceptor(&config.tls, false).await?)
+        };
+        let client_cert_tls = if config.tls.mode == crate::config::TlsMode::Disabled {
+            None
+        } else {
+            Some(tls::acceptor(&config.tls, true).await?)
         };
         let max_connections = config.listener.max_connections;
         Ok(Self {
@@ -89,6 +95,7 @@ impl Server {
                 telemetry,
                 payloads,
                 tls,
+                client_cert_tls,
                 sessions: AtomicU32::new(50),
                 metrics: Metrics::default(),
                 connection_limit: Arc::new(Semaphore::new(max_connections)),

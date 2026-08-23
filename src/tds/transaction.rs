@@ -14,6 +14,7 @@ pub struct TransactionRequest {
     pub isolation_level: Option<u8>,
     pub name: Option<String>,
     pub begin_after: Option<bool>,
+    pub begin_name: Option<String>,
     pub headers: Vec<StreamHeader>,
     pub enclave_package_bytes: Option<usize>,
 }
@@ -75,6 +76,7 @@ fn parse_inner(
         isolation_level: None,
         name: None,
         begin_after: None,
+        begin_name: None,
         headers,
         enclave_package_bytes,
     };
@@ -109,7 +111,8 @@ fn parse_inner(
                     Error::Protocol("truncated transaction isolation level".into())
                 })?);
                 position += 1;
-                let (_, consumed) = b_varbyte(&body[position..])?;
+                let (begin_name, consumed) = b_varbyte(&body[position..])?;
+                result.begin_name = Some(String::from_utf8_lossy(begin_name).into_owned());
                 position += consumed;
             }
             ensure_end(body, position)?;
@@ -187,6 +190,15 @@ mod tests {
 
         let save = parse(&[9, 0, 2, b's', b'p']).unwrap();
         assert_eq!(save.name.as_deref(), Some("sp"));
+    }
+
+    #[test]
+    fn retains_commit_begin_after_transaction_name() {
+        let parsed = parse(&[7, 0, 3, b'o', b'l', b'd', 1, 2, 3, b'n', b'e', b'w']).unwrap();
+        assert_eq!(parsed.name.as_deref(), Some("old"));
+        assert_eq!(parsed.begin_after, Some(true));
+        assert_eq!(parsed.isolation_level, Some(2));
+        assert_eq!(parsed.begin_name.as_deref(), Some("new"));
     }
 
     #[test]
