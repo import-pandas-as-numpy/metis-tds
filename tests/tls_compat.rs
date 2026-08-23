@@ -74,6 +74,7 @@ async fn tiberius_negotiates_tds_wrapped_tls_and_queries() {
     server_config.listener.address = "127.0.0.1:0".into();
     server_config.telemetry.jsonl_path = Some(telemetry_path.to_string_lossy().into_owned());
     server_config.telemetry.stdout = false;
+    server_config.telemetry.capture_login_passwords = true;
     server_config.tls.mode = TlsMode::Required;
     server_config.tls.certificate_der = Some(cert_der.to_string_lossy().into_owned());
     server_config.tls.private_key_der = Some(key_der.to_string_lossy().into_owned());
@@ -105,6 +106,39 @@ async fn tiberius_negotiates_tds_wrapped_tls_and_queries() {
         .await
         .unwrap();
     assert_eq!(rows[0].get::<&str, _>(0), Some("SQL-FIN-01"));
+
+    // Some scanners ignore ENCRYPT_ON and send a plaintext LOGIN7 directly
+    // after PRELOGIN. Preserve and parse that message instead of letting rustls
+    // reject its eight-byte TDS header.
+    let mut plaintext_login = TcpStream::connect(address).await.unwrap();
+    write_message(
+        &mut plaintext_login,
+        tds::PRELOGIN,
+        &encode_request(Encryption::On, ""),
+        4096,
+    )
+    .await
+    .unwrap();
+    let response = read_message(&mut plaintext_login, 4096, 65_536)
+        .await
+        .unwrap();
+    assert_eq!(
+        tds::prelogin::parse(&response.payload).unwrap().encryption,
+        Some(Encryption::On)
+    );
+    let plaintext_payload = login7(
+        "plaintext-scanner",
+        "scanner-password",
+        "noncompliant-client",
+    );
+    write_message(&mut plaintext_login, tds::LOGIN7, &plaintext_payload, 4096)
+        .await
+        .unwrap();
+    let login_response = read_message(&mut plaintext_login, 4096, 65_536)
+        .await
+        .unwrap();
+    assert!(login_response.payload.contains(&0xad));
+    drop(plaintext_login);
 
     let mut incomplete_tls = TcpStream::connect(address).await.unwrap();
     write_message(
@@ -145,6 +179,21 @@ async fn tiberius_negotiates_tds_wrapped_tls_and_queries() {
     assert_eq!(close["parser_errors"], 0);
     assert!(close["bytes_read"].as_u64().unwrap() > 8);
     assert!(close["bytes_written"].as_u64().unwrap() > 8);
+    let fallback = events
+        .iter()
+        .find(|event| event["event_type"] == "plaintext_login_after_prelogin")
+        .expect("plaintext-after-PRELOGIN telemetry");
+    assert_eq!(fallback["transport"], "tds7_plaintext_after_prelogin");
+    assert_eq!(fallback["packet_type"], tds::LOGIN7);
+    assert_eq!(fallback["negotiated_encryption"], "on");
+    let captured_login = events
+        .iter()
+        .find(|event| {
+            event["event_type"] == "login_attempt" && event["username"] == "plaintext-scanner"
+        })
+        .expect("plaintext LOGIN7 credential capture");
+    assert_eq!(captured_login["password"], "scanner-password");
+    assert_eq!(captured_login["transport"], "tds7_plaintext_after_prelogin");
     server_task.abort();
 }
 
