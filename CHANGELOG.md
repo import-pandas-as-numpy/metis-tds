@@ -4,6 +4,11 @@ All notable user-visible changes are documented here. The project follows [Seman
 
 ## Unreleased
 
+### Fixed
+
+- Emit protocol-correct TDS 4.2 login acknowledgements, errors, informational messages, result metadata, rows, and completion tokens so legacy clients can remain connected and execute SQL batches.
+- Negotiate LOGIN7 response versions and pre-TDS-7.2 field widths from the client's requested protocol instead of always emitting TDS 7.4 layouts.
+
 ## 0.1.6 - 2026-08-23
 
 ### Fixed

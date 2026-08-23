@@ -265,7 +265,16 @@ async fn legacy_direct_login_captures_password_and_enters_authentication() {
         .await
         .unwrap();
     let response = read_message(&mut client, 4096, 65_536).await.unwrap();
-    assert!(response.payload.contains(&0xad));
+    assert_tds42_login_success(&response.payload);
+
+    write_message(&mut client, tds::SQL_BATCH, b"SELECT @@VERSION", 4096)
+        .await
+        .unwrap();
+    let result = read_message(&mut client, 4096, 65_536).await.unwrap();
+    let (columns, rows) = parse_tds42_varchar_result(&result.payload);
+    assert_eq!(columns, vec![""]);
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0][0].starts_with("Microsoft SQL Server"));
     drop(client);
 
     let events = wait_for_events(&telemetry_path, "login_attempt").await;
@@ -682,4 +691,79 @@ fn contains_utf16(haystack: &[u8], needle: &str) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+fn assert_tds42_login_success(payload: &[u8]) {
+    assert_eq!(payload.first(), Some(&0xad));
+    let body_len = usize::from(u16::from_le_bytes([payload[1], payload[2]]));
+    assert_eq!(body_len + 3 + 9, payload.len());
+    assert_eq!(payload[3], 1);
+    assert_eq!(&payload[4..8], &[0x04, 0x02, 0x00, 0x00]);
+    let name_len = usize::from(payload[8]);
+    assert_eq!(&payload[9..9 + name_len], b"Microsoft SQL Server");
+    let version = 9 + name_len;
+    assert_eq!(&payload[version..version + 4], &[95, 16, 0, 89]);
+    assert_eq!(payload[version + 4], 0xfd);
+    assert_eq!(&payload[version + 5..], &[0; 8]);
+}
+
+fn parse_tds42_varchar_result(payload: &[u8]) -> (Vec<String>, Vec<Vec<String>>) {
+    let mut cursor = 0;
+    assert_eq!(payload[cursor], 0xa0);
+    cursor += 1;
+    let names_len = take_u16(payload, &mut cursor);
+    let names_end = cursor + names_len;
+    let mut columns = Vec::new();
+    while cursor < names_end {
+        columns.push(take_legacy_string(payload, &mut cursor));
+    }
+    assert_eq!(cursor, names_end);
+
+    assert_eq!(payload[cursor], 0xa1);
+    cursor += 1;
+    let formats_len = take_u16(payload, &mut cursor);
+    assert_eq!(formats_len, columns.len() * 6);
+    for _ in &columns {
+        assert_eq!(take_u16(payload, &mut cursor), 2); // varchar user type
+        assert_eq!(take_u16(payload, &mut cursor), 1); // nullable
+        assert_eq!(payload[cursor], 0x27); // SYBVARCHAR
+        assert_eq!(payload[cursor + 1], u8::MAX);
+        cursor += 2;
+    }
+
+    let mut rows = Vec::new();
+    while payload[cursor] == 0xd1 {
+        cursor += 1;
+        let mut row = Vec::new();
+        for _ in &columns {
+            row.push(take_legacy_string(payload, &mut cursor));
+        }
+        rows.push(row);
+    }
+
+    assert_eq!(payload[cursor], 0xfd);
+    assert_eq!(payload.len() - cursor, 9);
+    cursor += 1;
+    let status = take_u16(payload, &mut cursor);
+    assert_eq!(status & 0x10, 0x10);
+    assert_eq!(take_u16(payload, &mut cursor), 0);
+    let row_count = u32::from_le_bytes(payload[cursor..cursor + 4].try_into().unwrap());
+    assert_eq!(row_count as usize, rows.len());
+    cursor += 4;
+    assert_eq!(cursor, payload.len());
+    (columns, rows)
+}
+
+fn take_u16(payload: &[u8], cursor: &mut usize) -> usize {
+    let value = u16::from_le_bytes(payload[*cursor..*cursor + 2].try_into().unwrap());
+    *cursor += 2;
+    usize::from(value)
+}
+
+fn take_legacy_string(payload: &[u8], cursor: &mut usize) -> String {
+    let len = usize::from(payload[*cursor]);
+    *cursor += 1;
+    let value = String::from_utf8(payload[*cursor..*cursor + len].to_vec()).unwrap();
+    *cursor += len;
+    value
 }

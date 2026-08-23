@@ -613,6 +613,11 @@ where
         tds::LOGIN7 => tds::login7::parse(&login_message.payload)?,
         _ => return Err(Error::Protocol("expected LOGIN or LOGIN7 message".into())),
     };
+    let protocol = if legacy_login {
+        tokens::Protocol::Tds42
+    } else {
+        tokens::Protocol::Tds7(login.tds_version)
+    };
     let session_id = shared.sessions.fetch_add(1, Ordering::Relaxed);
     progress.session_id = Some(session_id);
     shared
@@ -683,6 +688,7 @@ where
     if !accepted {
         progress.enter("login_response");
         let response = tokens::login_failure(
+            protocol,
             &shared.config.personality.server_name,
             decision == AuthDecision::Locked,
         )?;
@@ -701,6 +707,7 @@ where
             .min(shared.config.limits.max_packet_bytes as u32)
     } as usize;
     let response = tokens::login_success(
+        protocol,
         if login.database.is_empty() {
             &shared.config.personality.default_database
         } else {
@@ -850,6 +857,7 @@ where
         shared.record_classification(outcome.classification);
         process_outcome(&shared, &session, &outcome).await;
         let response = tokens::response(
+            protocol,
             &outcome.result_sets,
             &outcome.messages,
             outcome.error.as_ref(),
