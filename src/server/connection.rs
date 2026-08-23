@@ -408,6 +408,40 @@ async fn handle_inner(
     }
     if use_tls {
         progress.enter("tls_handshake");
+        // Some opportunistic scanners send a plaintext LOGIN/LOGIN7 packet even
+        // after the server has selected encryption. Peek before handing the
+        // stream to rustls so we can capture the complete login message without
+        // weakening the TLS path for conforming clients.
+        let mut first = [0_u8; 1];
+        let first_len = timeout(
+            shared.config.listener.login_timeout(),
+            stream.peek(&mut first),
+        )
+        .await
+        .map_err(|_| Error::Tls("handshake timeout".into()))?
+        .map_err(|error| Error::Tls(error.to_string()))?;
+        if first_len == 0 {
+            return Err(Error::Tls("unexpected EOF during handshake".into()));
+        }
+        if matches!(first[0], tds::LOGIN | tds::LOGIN7) {
+            let transport = if first[0] == tds::LOGIN {
+                "tds42_plaintext_after_prelogin"
+            } else {
+                "tds7_plaintext_after_prelogin"
+            };
+            shared.telemetry.emit(
+                Event::new("plaintext_login_after_prelogin", Some(connection_id), None)
+                    .field("source_ip", peer.ip().to_string())
+                    .field("source_port", peer.port())
+                    .field("transport", transport)
+                    .field("packet_type", first[0])
+                    .field(
+                        "negotiated_encryption",
+                        format!("{response_encryption:?}").to_lowercase(),
+                    ),
+            );
+            return login_and_serve(shared, stream, peer, connection_id, progress, transport).await;
+        }
         let acceptor = shared
             .tls
             .as_ref()
