@@ -140,6 +140,34 @@ async fn tiberius_negotiates_tds_wrapped_tls_and_queries() {
     assert!(login_response.payload.contains(&0xad));
     drop(plaintext_login);
 
+    // TDS 7.0 and 7.1 end their fixed LOGIN7 header at byte 86. The final
+    // change-password and long-SSPI fields were added in TDS 7.2.
+    let mut legacy_plaintext_login = TcpStream::connect(address).await.unwrap();
+    write_message(
+        &mut legacy_plaintext_login,
+        tds::PRELOGIN,
+        &encode_request(Encryption::On, ""),
+        4096,
+    )
+    .await
+    .unwrap();
+    read_message(&mut legacy_plaintext_login, 4096, 65_536)
+        .await
+        .unwrap();
+    write_message(
+        &mut legacy_plaintext_login,
+        tds::LOGIN7,
+        &legacy_login7("sa", "SQL Server 2000 probe"),
+        4096,
+    )
+    .await
+    .unwrap();
+    let legacy_response = read_message(&mut legacy_plaintext_login, 4096, 65_536)
+        .await
+        .unwrap();
+    assert!(legacy_response.payload.contains(&0xad));
+    drop(legacy_plaintext_login);
+
     let mut incomplete_tls = TcpStream::connect(address).await.unwrap();
     write_message(
         &mut incomplete_tls,
@@ -194,6 +222,14 @@ async fn tiberius_negotiates_tds_wrapped_tls_and_queries() {
         .expect("plaintext LOGIN7 credential capture");
     assert_eq!(captured_login["password"], "scanner-password");
     assert_eq!(captured_login["transport"], "tds7_plaintext_after_prelogin");
+    let legacy_login = events
+        .iter()
+        .find(|event| event["event_type"] == "login_attempt" && event["username"] == "sa")
+        .expect("TDS 7.1 LOGIN7 capture");
+    assert_eq!(legacy_login["tds_version"], "0x71000001");
+    assert_eq!(legacy_login["password"], Value::Null);
+    assert_eq!(legacy_login["password_field_present"], false);
+    assert_eq!(legacy_login["transport"], "tds7_plaintext_after_prelogin");
     server_task.abort();
 }
 
@@ -360,6 +396,34 @@ fn login7(username: &str, password: &str, application: &str) -> Vec<u8> {
                 *byte = byte.rotate_right(4) ^ 0xa5;
             }
         }
+        packet[descriptor..descriptor + 2].copy_from_slice(&offset.to_le_bytes());
+        packet[descriptor + 2..descriptor + 4]
+            .copy_from_slice(&u16::try_from(encoded.len() / 2).unwrap().to_le_bytes());
+        packet.extend_from_slice(&encoded);
+    }
+    let packet_len = u32::try_from(packet.len()).unwrap();
+    packet[0..4].copy_from_slice(&packet_len.to_le_bytes());
+    packet
+}
+
+fn legacy_login7(username: &str, application: &str) -> Vec<u8> {
+    let mut packet = vec![0_u8; 86];
+    packet[4..8].copy_from_slice(&0x7100_0001_u32.to_le_bytes());
+    packet[8..12].copy_from_slice(&4096_u32.to_le_bytes());
+    packet[24] = 0xe0;
+    packet[25] = 0x03;
+    let fields = [
+        (36, "WIN-SQL2000"),
+        (40, username),
+        (48, application),
+        (52, "SQL-FIN-01"),
+        (60, "DB-Library"),
+        (64, "us_english"),
+        (68, "master"),
+    ];
+    for (descriptor, value) in fields {
+        let offset = u16::try_from(packet.len()).unwrap();
+        let encoded: Vec<u8> = value.encode_utf16().flat_map(u16::to_le_bytes).collect();
         packet[descriptor..descriptor + 2].copy_from_slice(&offset.to_le_bytes());
         packet[descriptor + 2..descriptor + 4]
             .copy_from_slice(&u16::try_from(encoded.len() / 2).unwrap().to_le_bytes());

@@ -1,6 +1,7 @@
 use crate::{Error, Result};
 
-const FIXED_LENGTH: usize = 94;
+const LEGACY_FIXED_LENGTH: usize = 86;
+const EXTENDED_FIXED_LENGTH: usize = 94;
 
 #[derive(Clone, Debug, Default)]
 pub struct LoginRequest {
@@ -35,50 +36,77 @@ impl LoginRequest {
 }
 
 pub fn parse(payload: &[u8]) -> Result<LoginRequest> {
-    if payload.len() < FIXED_LENGTH {
+    if payload.len() < 8 {
+        return Err(Error::Protocol("LOGIN7 fixed header is truncated".into()));
+    }
+    let tds_version = le_u32(payload, 4)?;
+    let fixed_length = fixed_length(tds_version);
+    if payload.len() < fixed_length {
         return Err(Error::Protocol("LOGIN7 fixed header is truncated".into()));
     }
     let declared = usize::try_from(le_u32(payload, 0)?)
         .map_err(|_| Error::Protocol("LOGIN7 length overflow".into()))?;
-    if declared < FIXED_LENGTH || declared > payload.len() {
+    if declared < fixed_length || declared > payload.len() {
         return Err(Error::Protocol("LOGIN7 declared length is invalid".into()));
     }
     let option_flags_2 = payload[25];
-    let username = field(payload, 40, declared, false, "username")?;
-    let password_raw = raw_field(payload, 44, declared, "password")?;
+    let username = field(payload, 40, declared, fixed_length, false, "username")?;
+    let password_raw = raw_field(payload, 44, declared, fixed_length, "password")?;
     let password_present = !password_raw.is_empty();
     let password = if password_present {
         Some(deobfuscate_password(password_raw)?)
     } else {
         None
     };
-    let sspi = sspi_field(payload, declared)?;
+    let sspi = sspi_field(payload, declared, fixed_length)?;
     Ok(LoginRequest {
-        tds_version: le_u32(payload, 4)?,
+        tds_version,
         packet_size: le_u32(payload, 8)?,
         option_flags_1: payload[24],
         option_flags_2,
         type_flags: payload[26],
         option_flags_3: payload[27],
-        client_hostname: field(payload, 36, declared, false, "client hostname")?,
+        client_hostname: field(
+            payload,
+            36,
+            declared,
+            fixed_length,
+            false,
+            "client hostname",
+        )?,
         username,
         password,
         password_present,
-        application_name: field(payload, 48, declared, false, "application name")?,
-        server_name: field(payload, 52, declared, false, "server name")?,
-        client_library: field(payload, 60, declared, false, "client library")?,
-        language: field(payload, 64, declared, false, "language")?,
-        database: field(payload, 68, declared, false, "database")?,
+        application_name: field(
+            payload,
+            48,
+            declared,
+            fixed_length,
+            false,
+            "application name",
+        )?,
+        server_name: field(payload, 52, declared, fixed_length, false, "server name")?,
+        client_library: field(payload, 60, declared, fixed_length, false, "client library")?,
+        language: field(payload, 64, declared, fixed_length, false, "language")?,
+        database: field(payload, 68, declared, fixed_length, false, "database")?,
         integrated_security: option_flags_2 & 0x80 != 0,
         sspi_bytes: sspi.len(),
         sspi_token_family: classify_sspi(sspi),
     })
 }
 
+fn fixed_length(tds_version: u32) -> usize {
+    match tds_version >> 24 {
+        0x70 | 0x71 => LEGACY_FIXED_LENGTH,
+        _ => EXTENDED_FIXED_LENGTH,
+    }
+}
+
 fn raw_field<'a>(
     payload: &'a [u8],
     descriptor_offset: usize,
     declared: usize,
+    fixed_length: usize,
     name: &str,
 ) -> Result<&'a [u8]> {
     let descriptor = payload
@@ -97,7 +125,7 @@ fn raw_field<'a>(
     let end = offset
         .checked_add(bytes)
         .ok_or_else(|| Error::Protocol("LOGIN7 field offset overflow".into()))?;
-    if end > declared || offset < FIXED_LENGTH {
+    if end > declared || offset < fixed_length {
         return Err(Error::Protocol(format!(
             "LOGIN7 {name} field is outside message (offset={offset}, bytes={bytes}, declared={declared})"
         )));
@@ -105,13 +133,18 @@ fn raw_field<'a>(
     Ok(&payload[offset..end])
 }
 
-fn sspi_field(payload: &[u8], declared: usize) -> Result<&[u8]> {
+fn sspi_field(payload: &[u8], declared: usize, fixed_length: usize) -> Result<&[u8]> {
     let descriptor = payload
         .get(78..82)
         .ok_or_else(|| Error::Protocol("LOGIN7 SSPI descriptor truncated".into()))?;
     let offset = usize::from(u16::from_le_bytes([descriptor[0], descriptor[1]]));
     let short_length = u16::from_le_bytes([descriptor[2], descriptor[3]]);
     let length = if short_length == u16::MAX {
+        if fixed_length < EXTENDED_FIXED_LENGTH {
+            return Err(Error::Protocol(
+                "LOGIN7 legacy SSPI length cannot use cbSSPILong".into(),
+            ));
+        }
         usize::try_from(le_u32(payload, 90)?)
             .map_err(|_| Error::Protocol("LOGIN7 SSPI length overflow".into()))?
     } else {
@@ -123,7 +156,7 @@ fn sspi_field(payload: &[u8], declared: usize) -> Result<&[u8]> {
     let end = offset
         .checked_add(length)
         .ok_or_else(|| Error::Protocol("LOGIN7 SSPI offset overflow".into()))?;
-    if offset < FIXED_LENGTH || end > declared {
+    if offset < fixed_length || end > declared {
         return Err(Error::Protocol(
             "LOGIN7 SSPI field is outside message".into(),
         ));
@@ -147,10 +180,11 @@ fn field(
     payload: &[u8],
     descriptor_offset: usize,
     declared: usize,
+    fixed_length: usize,
     allow_nul: bool,
     name: &str,
 ) -> Result<String> {
-    let raw = raw_field(payload, descriptor_offset, declared, name)?;
+    let raw = raw_field(payload, descriptor_offset, declared, fixed_length, name)?;
     decode_utf16(raw, allow_nul, name)
 }
 
@@ -210,14 +244,47 @@ mod tests {
 
     #[test]
     fn ignores_offsets_for_empty_variable_fields() {
-        let mut payload = vec![0_u8; FIXED_LENGTH];
-        payload[0..4].copy_from_slice(&(FIXED_LENGTH as u32).to_le_bytes());
+        let mut payload = vec![0_u8; EXTENDED_FIXED_LENGTH];
+        payload[0..4].copy_from_slice(&(EXTENDED_FIXED_LENGTH as u32).to_le_bytes());
         for descriptor in [36, 40, 44, 48, 52, 60, 64, 68, 78] {
             payload[descriptor..descriptor + 2].copy_from_slice(&u16::MAX.to_le_bytes());
         }
         let login = parse(&payload).unwrap();
         assert!(login.username.is_empty());
         assert!(!login.password_present);
+    }
+
+    #[test]
+    fn accepts_tds_71_fields_at_the_legacy_variable_boundary() {
+        let mut payload = vec![0_u8; LEGACY_FIXED_LENGTH];
+        payload[4..8].copy_from_slice(&0x7100_0001_u32.to_le_bytes());
+        payload[40..42].copy_from_slice(&(LEGACY_FIXED_LENGTH as u16).to_le_bytes());
+        payload[42..44].copy_from_slice(&2_u16.to_le_bytes());
+        payload.extend_from_slice(&[b's', 0, b'a', 0]);
+        let declared = payload.len() as u32;
+        payload[0..4].copy_from_slice(&declared.to_le_bytes());
+
+        let login = parse(&payload).unwrap();
+        assert_eq!(login.tds_version, 0x7100_0001);
+        assert_eq!(login.username, "sa");
+        assert!(!login.password_present);
+    }
+
+    #[test]
+    fn keeps_tds_72_fields_out_of_the_extended_fixed_header() {
+        let mut payload = vec![0_u8; EXTENDED_FIXED_LENGTH];
+        payload[0..4].copy_from_slice(&(EXTENDED_FIXED_LENGTH as u32).to_le_bytes());
+        payload[4..8].copy_from_slice(&0x7209_0002_u32.to_le_bytes());
+        payload[40..42].copy_from_slice(&(LEGACY_FIXED_LENGTH as u16).to_le_bytes());
+        payload[42..44].copy_from_slice(&2_u16.to_le_bytes());
+        payload[LEGACY_FIXED_LENGTH..LEGACY_FIXED_LENGTH + 4].copy_from_slice(&[b's', 0, b'a', 0]);
+
+        let error = parse(&payload).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("username field is outside message")
+        );
     }
 
     #[test]
@@ -237,10 +304,11 @@ mod tests {
     #[test]
     fn identifies_sspi_without_retaining_the_token() {
         let token = b"NTLMSSP\0\x01\0\0\0";
-        let mut payload = vec![0_u8; FIXED_LENGTH];
-        payload[0..4].copy_from_slice(&((FIXED_LENGTH + token.len()) as u32).to_le_bytes());
+        let mut payload = vec![0_u8; EXTENDED_FIXED_LENGTH];
+        payload[0..4]
+            .copy_from_slice(&((EXTENDED_FIXED_LENGTH + token.len()) as u32).to_le_bytes());
         payload[25] = 0x80;
-        payload[78..80].copy_from_slice(&(FIXED_LENGTH as u16).to_le_bytes());
+        payload[78..80].copy_from_slice(&(EXTENDED_FIXED_LENGTH as u16).to_le_bytes());
         payload[80..82].copy_from_slice(&(token.len() as u16).to_le_bytes());
         payload.extend_from_slice(token);
 
