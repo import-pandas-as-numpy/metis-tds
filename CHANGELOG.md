@@ -4,6 +4,16 @@ All notable user-visible changes are documented here. The project follows [Seman
 
 ## Unreleased
 
+## 0.1.5 - 2026-08-23
+
+### Fixed
+
+- Capture and parse plaintext LOGIN and LOGIN7 messages sent after PRELOGIN encryption negotiation by noncompliant scanners, while preserving the normal TLS path for conforming clients.
+
+### Added
+
+- Emit explicit `plaintext_login_after_prelogin` telemetry when a client ignores the negotiated encryption mode.
+
 ## 0.1.4 - 2026-08-22
 
 ### Fixed
