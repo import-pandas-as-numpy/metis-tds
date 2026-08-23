@@ -63,7 +63,7 @@ cargo deny check
 cargo deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check
 ```
 
-The test suite includes a standalone protocol client, independent Tiberius client flows for plaintext SQL batch/RPC and required TDS 7.x TLS, and a strict TDS 8.0 raw-TLS/PRELOGIN/LOGIN7 flow. `sqlcmd`, SSMS, FreeTDS, Impacket, Censys, and Shodan remain unclaimed until they have been exercised against a deployed instance.
+The test suite includes a strict standalone TDS 4.2 login/query/result flow, independent Tiberius client flows for plaintext SQL batch/RPC and required TDS 7.x TLS, and a strict TDS 8.0 raw-TLS/PRELOGIN/LOGIN7 flow. `sqlcmd`, SSMS, FreeTDS, Impacket, Censys, and Shodan remain unclaimed until they have been exercised against a deployed instance.
 
 Coverage-guided fuzz targets are isolated from the production dependency graph under `fuzz/`. They require nightly Rust and `cargo-fuzz 0.13.2`:
 
