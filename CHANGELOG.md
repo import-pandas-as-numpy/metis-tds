@@ -4,6 +4,16 @@ All notable user-visible changes are documented here. The project follows [Seman
 
 ## Unreleased
 
+## 0.1.6 - 2026-08-23
+
+### Fixed
+
+- Parse the 86-byte fixed LOGIN7 header used by TDS 7.0 and 7.1 clients without weakening the 94-byte boundary required by TDS 7.2 and later.
+
+### Changed
+
+- Build amd64 and arm64 release images on native GitHub-hosted runners, then publish them as one attested multi-platform manifest.
+
 ## 0.1.5 - 2026-08-23
 
 ### Fixed

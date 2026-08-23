@@ -41,13 +41,13 @@ TLS certificate conversion, systemd hardening, outbound-deny guidance, and Inter
 Release images for `linux/amd64` and `linux/arm64` are public and can be pulled anonymously from GHCR. Pin the reviewed release or, preferably, the manifest digest recorded by the registry:
 
 ```console
-docker pull ghcr.io/import-pandas-as-numpy/metis-tds:0.1.5
+docker pull ghcr.io/import-pandas-as-numpy/metis-tds:0.1.6
 docker run --read-only --cap-drop=ALL --security-opt=no-new-privileges \
   --tmpfs /tmp:rw,noexec,nosuid,size=16m \
   --mount type=bind,src="$PWD/config/local.json",dst=/etc/metis-tds/config.json,readonly \
   --mount type=volume,src=metis-tds-data,dst=/var/lib/metis-tds \
   --mount type=volume,src=metis-tds-logs,dst=/var/log/metis-tds \
-  -p 1433:1433 ghcr.io/import-pandas-as-numpy/metis-tds:0.1.5
+  -p 1433:1433 ghcr.io/import-pandas-as-numpy/metis-tds:0.1.6
 ```
 
 The image does not contain a deployment configuration. Supply one at runtime at `/etc/metis-tds/config.json`; for container networking its `listener.address` must use `0.0.0.0:1433`. Keep telemetry and captured-payload paths in the mounted data volumes. For an Internet-facing deployment, enable TLS and enforce outbound denial at the container or host network boundary.
