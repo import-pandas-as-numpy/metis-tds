@@ -139,3 +139,16 @@ jobs:
           severity-cutoff: high
           only-fixed: true
           output-format: table
+
+  container-gate:
+    name: Container build
+    if: ${{ always() }}
+    needs: container
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require every native container build
+        env:
+          CONTAINER_RESULT: ${{ needs.container.result }}
+        run: test "${CONTAINER_RESULT}" = success
