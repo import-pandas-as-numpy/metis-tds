@@ -10,6 +10,7 @@ const COLFMT: u8 = 0xa1;
 const ROW: u8 = 0xd1;
 const DONE: u8 = 0xfd;
 const DONEPROC: u8 = 0xfe;
+const SSPI: u8 = 0xed;
 const DONE_MORE: u16 = 0x0001;
 const DONE_ERROR: u16 = 0x0002;
 const DONE_COUNT: u16 = 0x0010;
@@ -124,6 +125,12 @@ pub fn login_failure(protocol: Protocol, server: &str, locked: bool) -> Result<V
     )?;
     done(&mut out, protocol, DONE, DONE_ERROR, 0);
     Ok(out)
+}
+
+pub fn sspi_challenge(token: &[u8]) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    length_prefixed(&mut output, SSPI, |body| body.extend_from_slice(token))?;
+    Ok(output)
 }
 
 pub fn response(

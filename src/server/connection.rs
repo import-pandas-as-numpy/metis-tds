@@ -172,6 +172,72 @@ struct MeteredIo<S> {
     counters: Arc<WireCounters>,
 }
 
+struct MessageCaptureIo<S> {
+    inner: S,
+    read_capture: Vec<u8>,
+    maximum: usize,
+    truncated: bool,
+}
+
+impl<S> MessageCaptureIo<S> {
+    fn new(inner: S, maximum: usize) -> Self {
+        Self {
+            inner,
+            read_capture: Vec::new(),
+            maximum,
+            truncated: false,
+        }
+    }
+
+    fn clear_capture(&mut self) {
+        self.read_capture.clear();
+        self.truncated = false;
+    }
+
+    fn captured(&self) -> &[u8] {
+        &self.read_capture
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for MessageCaptureIo<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buffer.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buffer);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            let newly_read = &buffer.filled()[before..];
+            let remaining = self.maximum.saturating_sub(self.read_capture.len());
+            let retained = newly_read.len().min(remaining);
+            if retained > 0 {
+                self.read_capture.extend_from_slice(&newly_read[..retained]);
+            }
+            self.truncated |= retained < newly_read.len();
+        }
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for MessageCaptureIo<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 impl<S> MeteredIo<S> {
     fn new(inner: S, counters: Arc<WireCounters>) -> Self {
         Self { inner, counters }
@@ -272,18 +338,28 @@ pub async fn handle(
             .await
             .map_err(|error| progress.failure(error));
     }
-    if matches!(first[0], tds::LOGIN | tds::LOGIN7) {
-        let transport = if first[0] == tds::LOGIN {
-            "tds42_direct"
-        } else {
-            "tds7_direct"
+    if tds::is_authentication_packet(first[0]) {
+        let transport = match first[0] {
+            tds::LOGIN => "tds42_direct",
+            tds::LOGIN7 => "tds7_direct",
+            tds::SSPI => "sspi_direct",
+            tds::FEDAUTH_TOKEN => "fedauth_direct",
+            _ => unreachable!("authentication packet taxonomy"),
         };
         shared.telemetry.emit(
-            Event::new("direct_login_candidate", Some(connection_id), None)
-                .field("source_ip", peer.ip().to_string())
-                .field("source_port", peer.port())
-                .field("transport", transport)
-                .field("packet_type", first[0]),
+            Event::new(
+                if matches!(first[0], tds::LOGIN | tds::LOGIN7) {
+                    "direct_login_candidate"
+                } else {
+                    "direct_authentication_candidate"
+                },
+                Some(connection_id),
+                None,
+            )
+            .field("source_ip", peer.ip().to_string())
+            .field("source_port", peer.port())
+            .field("transport", transport)
+            .field("packet_type", first[0]),
         );
         return login_and_serve(
             shared,
@@ -332,13 +408,38 @@ async fn handle_tds8(
     .await
     .map_err(|_| Error::Protocol("TDS 8.0 PRELOGIN timeout".into()))??;
     progress.observe_message(&prelogin_message);
+    observe_inbound_message(
+        &shared,
+        peer,
+        connection_id,
+        None,
+        "prelogin8_read",
+        "tds8",
+        &prelogin_message,
+    )
+    .await;
     progress.enter("prelogin8_parse");
     if prelogin_message.packet_type != tds::PRELOGIN {
         return Err(Error::Protocol(
             "expected PRELOGIN after TDS 8.0 TLS handshake".into(),
         ));
     }
-    let prelogin = tds::prelogin::parse(&prelogin_message.payload)?;
+    let prelogin = match tds::prelogin::parse_for_telemetry(&prelogin_message.payload) {
+        Ok(value) => value,
+        Err(error) => {
+            capture_protocol_artifact(
+                &shared,
+                peer,
+                connection_id,
+                None,
+                "prelogin_parse_failure",
+                &prelogin_message,
+                "tds8",
+            )
+            .await;
+            return Err(error);
+        }
+    };
     let instance_matches = instance_matches(
         prelogin.instance.as_deref(),
         &shared.config.personality.instance_name,
@@ -377,11 +478,36 @@ async fn handle_inner(
     .await
     .map_err(|_| Error::Protocol("PRELOGIN timeout".into()))??;
     progress.observe_message(&prelogin_message);
+    observe_inbound_message(
+        &shared,
+        peer,
+        connection_id,
+        None,
+        "prelogin_read",
+        "tds7",
+        &prelogin_message,
+    )
+    .await;
     progress.enter("prelogin_parse");
     if prelogin_message.packet_type != tds::PRELOGIN {
         return Err(Error::Protocol("first message was not PRELOGIN".into()));
     }
-    let prelogin = tds::prelogin::parse(&prelogin_message.payload)?;
+    let prelogin = match tds::prelogin::parse_for_telemetry(&prelogin_message.payload) {
+        Ok(value) => value,
+        Err(error) => {
+            capture_protocol_artifact(
+                &shared,
+                peer,
+                connection_id,
+                None,
+                "prelogin_parse_failure",
+                &prelogin_message,
+                "tds7",
+            )
+            .await;
+            return Err(error);
+        }
+    };
     let requested_encryption = prelogin.encryption.unwrap_or(Encryption::Off);
     let (response_encryption, use_tls) = negotiate(shared.config.tls.mode, requested_encryption);
     let instance_matches = instance_matches(
@@ -423,22 +549,32 @@ async fn handle_inner(
         if first_len == 0 {
             return Err(Error::Tls("unexpected EOF during handshake".into()));
         }
-        if matches!(first[0], tds::LOGIN | tds::LOGIN7) {
-            let transport = if first[0] == tds::LOGIN {
-                "tds42_plaintext_after_prelogin"
-            } else {
-                "tds7_plaintext_after_prelogin"
+        if tds::is_authentication_packet(first[0]) {
+            let transport = match first[0] {
+                tds::LOGIN => "tds42_plaintext_after_prelogin",
+                tds::LOGIN7 => "tds7_plaintext_after_prelogin",
+                tds::SSPI => "sspi_plaintext_after_prelogin",
+                tds::FEDAUTH_TOKEN => "fedauth_plaintext_after_prelogin",
+                _ => unreachable!("authentication packet taxonomy"),
             };
             shared.telemetry.emit(
-                Event::new("plaintext_login_after_prelogin", Some(connection_id), None)
-                    .field("source_ip", peer.ip().to_string())
-                    .field("source_port", peer.port())
-                    .field("transport", transport)
-                    .field("packet_type", first[0])
-                    .field(
-                        "negotiated_encryption",
-                        format!("{response_encryption:?}").to_lowercase(),
-                    ),
+                Event::new(
+                    if matches!(first[0], tds::LOGIN | tds::LOGIN7) {
+                        "plaintext_login_after_prelogin"
+                    } else {
+                        "plaintext_authentication_after_prelogin"
+                    },
+                    Some(connection_id),
+                    None,
+                )
+                .field("source_ip", peer.ip().to_string())
+                .field("source_port", peer.port())
+                .field("transport", transport)
+                .field("packet_type", first[0])
+                .field(
+                    "negotiated_encryption",
+                    format!("{response_encryption:?}").to_lowercase(),
+                ),
             );
             return login_and_serve(shared, stream, peer, connection_id, progress, transport).await;
         }
@@ -489,6 +625,9 @@ fn emit_prelogin(
                 format!("{response_encryption:?}").to_lowercase(),
             )
             .field("mars_requested", prelogin.mars)
+            .field("trace_id_present", prelogin.trace_id.is_some())
+            .field("fedauth_required", prelogin.fedauth_required)
+            .field("nonce_present", prelogin.nonce.is_some())
             .field("instance", &prelogin.instance)
             .field(
                 "instance_matches",
@@ -497,7 +636,10 @@ fn emit_prelogin(
                     &shared.config.personality.instance_name,
                 ),
             )
-            .field("unknown_tokens", &prelogin.unknown_tokens),
+            .field("unknown_tokens", &prelogin.unknown_tokens)
+            .field("unknown_token_lengths", &prelogin.unknown_token_lengths)
+            .field("parse_warnings", &prelogin.parse_warnings)
+            .field("structurally_valid", prelogin.parse_warnings.is_empty()),
     );
 }
 
@@ -559,7 +701,7 @@ fn instance_matches(requested: Option<&str>, configured: &str) -> bool {
 
 async fn login_and_serve<S>(
     shared: Arc<Shared>,
-    mut stream: S,
+    stream: S,
     peer: SocketAddr,
     connection_id: Uuid,
     progress: &mut Progress,
@@ -568,8 +710,9 @@ async fn login_and_serve<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut stream = MessageCaptureIo::new(stream, shared.config.limits.max_payload_bytes);
     progress.enter("login_read");
-    let login_message = timeout(
+    let login_result = timeout(
         shared.config.listener.login_timeout(),
         read_message(
             &mut stream,
@@ -577,9 +720,50 @@ where
             shared.config.limits.max_message_bytes,
         ),
     )
-    .await
-    .map_err(|_| Error::Protocol("login message timeout".into()))??;
+    .await;
+    let login_message = match login_result {
+        Ok(Ok(message)) => message,
+        Ok(Err(error)) => {
+            capture_incomplete_ingress(
+                &shared,
+                peer,
+                connection_id,
+                None,
+                transport,
+                stream.captured(),
+                stream.truncated,
+                error.kind(),
+            )
+            .await;
+            return Err(error);
+        }
+        Err(_) => {
+            capture_incomplete_ingress(
+                &shared,
+                peer,
+                connection_id,
+                None,
+                transport,
+                stream.captured(),
+                stream.truncated,
+                "timeout",
+            )
+            .await;
+            return Err(Error::Protocol("login message timeout".into()));
+        }
+    };
+    stream.clear_capture();
     progress.observe_message(&login_message);
+    observe_inbound_message(
+        &shared,
+        peer,
+        connection_id,
+        None,
+        "login_read",
+        transport,
+        &login_message,
+    )
+    .await;
     if matches!(transport, "tds42_direct" | "tds7_direct") {
         shared
             .metrics
@@ -603,15 +787,81 @@ where
         ("tds8", tds::LOGIN) => "tds42_over_tds8",
         (value, _) => value,
     };
-    if matches!(login_message.packet_type, tds::LOGIN | tds::LOGIN7) {
-        progress.enter("login_capture");
-        capture_login_message(&shared, peer, connection_id, &login_message, transport).await;
-    }
     progress.enter("login_parse");
     let mut login = match login_message.packet_type {
-        tds::LOGIN => tds::login::parse(&login_message.payload)?,
-        tds::LOGIN7 => tds::login7::parse(&login_message.payload)?,
-        _ => return Err(Error::Protocol("expected LOGIN or LOGIN7 message".into())),
+        tds::LOGIN => tds::login::parse_for_telemetry(&login_message.payload)?,
+        tds::LOGIN7 => tds::login7::parse_for_telemetry(&login_message.payload)?,
+        tds::SSPI => {
+            let token = tds::sspi::parse(&login_message.payload);
+            shared.telemetry.emit(
+                Event::new("sspi_message", Some(connection_id), None)
+                    .field("source_ip", peer.ip().to_string())
+                    .field("transport", transport)
+                    .field("token_family", token.family)
+                    .field("message_type", token.message_type)
+                    .field("token_bytes", token.bytes)
+                    .field("unexpected_state", true),
+            );
+            return Err(Error::Protocol("SSPI message arrived before LOGIN7".into()));
+        }
+        tds::FEDAUTH_TOKEN => {
+            let token = tds::fedauth::parse(&login_message.payload, false)?;
+            shared.telemetry.emit(
+                Event::new("federated_authentication_token", Some(connection_id), None)
+                    .field("source_ip", peer.ip().to_string())
+                    .field("transport", transport)
+                    .field("token_bytes", token.token.len())
+                    .field("nonce_present", token.nonce.is_some())
+                    .field("unexpected_state", true),
+            );
+            return Err(Error::Protocol(
+                "federated authentication token arrived before LOGIN7".into(),
+            ));
+        }
+        tds::TDS5_NORMAL => {
+            let auth = tds::tds5::parse_authentication(
+                &login_message.payload,
+                shared.config.limits.max_payload_bytes,
+            )?;
+            capture_protocol_artifact(
+                &shared,
+                peer,
+                connection_id,
+                None,
+                "tds5_authentication_before_login",
+                &login_message,
+                transport,
+            )
+            .await;
+            shared.telemetry.emit(
+                Event::new("tds5_authentication_stream", Some(connection_id), None)
+                    .field("source_ip", peer.ip().to_string())
+                    .field("transport", transport)
+                    .field("message_types", auth.message_types)
+                    .field("parameter_formats", auth.parameter_formats)
+                    .field("parameter_sets", auth.parameter_sets)
+                    .field("parameter_value_bytes", auth.parameter_value_bytes)
+                    .field("commands", &auth.commands)
+                    .field("parameter_values", &auth.parameter_values)
+                    .field("unexpected_state", true),
+            );
+            return Err(Error::Protocol(
+                "TDS 5 authentication continuation arrived before LOGIN".into(),
+            ));
+        }
+        _ => {
+            capture_protocol_artifact(
+                &shared,
+                peer,
+                connection_id,
+                None,
+                "unexpected_message_before_login",
+                &login_message,
+                transport,
+            )
+            .await;
+            return Err(Error::Protocol("expected LOGIN or LOGIN7 message".into()));
+        }
     };
     let protocol = if legacy_login {
         tokens::Protocol::Tds42
@@ -632,7 +882,8 @@ where
         (bypass_threshold, source_login_attempt),
         (Some(threshold), Some(attempt)) if attempt > threshold
     );
-    let decision = if login.integrated_security {
+    let login_structurally_valid = login.parse_warnings.is_empty();
+    let decision = if !login_structurally_valid || login.integrated_security {
         AuthDecision::Reject
     } else if source_auth_bypass {
         shared
@@ -667,10 +918,30 @@ where
         .field("client_library", &login.client_library)
         .field("tds_version", format!("0x{:08x}", login.tds_version))
         .field("packet_size", login.packet_size)
+        .field(
+            "client_program_version",
+            format!("0x{:08x}", login.client_program_version),
+        )
+        .field("client_pid", login.client_pid)
+        .field("connection_id_hint", login.connection_id)
+        .field("client_timezone", login.client_timezone)
+        .field("client_lcid", login.client_lcid)
+        .field("client_id", hex_version(login.client_id))
         .field("password_field_present", login.password_present)
+        .field("change_password_field_present", login.new_password_present)
+        .field("attach_database_file", &login.attach_database_file)
         .field("integrated_security", login.integrated_security)
         .field("sspi_bytes", login.sspi_bytes)
         .field("sspi_token_family", login.sspi_token_family)
+        .field("feature_extensions", &login.features)
+        .field("parse_warnings", &login.parse_warnings)
+        .field("structurally_valid", login_structurally_valid)
+        .field("legacy_security_flags", login.legacy_security_flags)
+        .field("legacy_capabilities_bytes", login.legacy_capabilities_bytes)
+        .field(
+            "legacy_authentication_bytes",
+            login.legacy_authentication_bytes,
+        )
         .field("accepted", accepted)
         .field("source_login_attempt_number", source_login_attempt)
         .field("source_auth_bypass_threshold", bypass_threshold)
@@ -680,9 +951,32 @@ where
             shared.config.personality.is_honey_login(&login.username),
         );
     if shared.config.telemetry.capture_login_passwords {
-        login_event = login_event.field("password", login.password_for_capture());
+        login_event = login_event
+            .field("password", login.password_for_capture())
+            .field("new_password", login.new_password_for_capture());
     }
     shared.telemetry.emit(login_event);
+
+    if login.integrated_security {
+        let initial_sspi = if legacy_login {
+            &[][..]
+        } else {
+            tds::login7::sspi_token(&login_message.payload).unwrap_or(&[])
+        };
+        login.discard_password();
+        return negotiate_integrated_authentication(
+            &shared,
+            &mut stream,
+            peer,
+            connection_id,
+            session_id,
+            progress,
+            transport,
+            protocol,
+            initial_sspi,
+        )
+        .await;
+    }
 
     login.discard_password();
     if !accepted {
@@ -740,6 +1034,7 @@ where
         progress.enter("request_read");
         progress.requests = session.request_count;
         let idle_deadline = TokioInstant::now() + shared.config.listener.idle_timeout();
+        stream.clear_capture();
         let message = match timeout_at(
             deadline.min(idle_deadline),
             read_message(
@@ -752,9 +1047,33 @@ where
         {
             Ok(Ok(message)) => message,
             Ok(Err(Error::Io(error))) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                capture_incomplete_ingress(
+                    &shared,
+                    peer,
+                    connection_id,
+                    Some(session.session_id),
+                    transport,
+                    stream.captured(),
+                    stream.truncated,
+                    "io",
+                )
+                .await;
                 return Ok(progress.summary("client_closed"));
             }
-            Ok(Err(error)) => return Err(error),
+            Ok(Err(error)) => {
+                capture_incomplete_ingress(
+                    &shared,
+                    peer,
+                    connection_id,
+                    Some(session.session_id),
+                    transport,
+                    stream.captured(),
+                    stream.truncated,
+                    error.kind(),
+                )
+                .await;
+                return Err(error);
+            }
             Err(_) if TokioInstant::now() >= deadline => {
                 return Ok(progress.summary("session_timeout"));
             }
@@ -763,6 +1082,16 @@ where
             }
         };
         progress.observe_message(&message);
+        observe_inbound_message(
+            &shared,
+            peer,
+            connection_id,
+            Some(session.session_id),
+            "request_read",
+            transport,
+            &message,
+        )
+        .await;
         progress.enter("request_parse");
         if !shared.allow_request(peer.ip()) {
             shared.telemetry.emit(
@@ -777,13 +1106,42 @@ where
             tds::SQL_BATCH => {
                 progress.enter("sql_batch_parse");
                 shared.metrics.sql_batches.fetch_add(1, Ordering::Relaxed);
-                let sql = if legacy_login {
-                    tds::batch::decode_legacy(
+                let (sql, headers) = if legacy_login {
+                    (
+                        tds::batch::decode_legacy(
+                            &message.payload,
+                            shared.config.limits.max_sql_batch_bytes,
+                        )?,
+                        Vec::new(),
+                    )
+                } else {
+                    let tds_version = match protocol {
+                        tokens::Protocol::Tds7(version) => version >> 24,
+                        tokens::Protocol::Tds42 => 0,
+                    };
+                    let batch = match tds::batch::parse_with_context(
                         &message.payload,
                         shared.config.limits.max_sql_batch_bytes,
-                    )?
-                } else {
-                    tds::batch::decode(&message.payload, shared.config.limits.max_sql_batch_bytes)?
+                        tds_version >= 0x72,
+                        tds_version >= 0x74,
+                        tds::enclave::LengthEncoding::None,
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            capture_protocol_artifact(
+                                &shared,
+                                peer,
+                                connection_id,
+                                Some(session_id),
+                                "sql_batch_parse_failure",
+                                &message,
+                                transport,
+                            )
+                            .await;
+                            return Err(error);
+                        }
+                    };
+                    (batch.sql, batch.headers)
                 };
                 let outcome = handle_sql(&mut session, &shared.config.personality, &sql);
                 emit_request(
@@ -792,17 +1150,36 @@ where
                     "sql_batch",
                     outcome.classification,
                     Event::new("sql_batch", Some(connection_id), Some(session_id))
-                        .field("raw_sql", &sql),
+                        .field("raw_sql", &sql)
+                        .field("stream_headers", &headers),
                 );
                 (outcome, false)
             }
             tds::RPC => {
                 progress.enter("rpc_parse");
                 shared.metrics.rpc_requests.fetch_add(1, Ordering::Relaxed);
-                let rpc = tds::rpc::parse(
+                let rpc = match tds::rpc::parse_with_context(
                     &message.payload,
                     shared.config.limits.max_rpc_parameter_bytes,
-                )?;
+                    matches!(protocol, tokens::Protocol::Tds7(version) if version >> 24 >= 0x72),
+                    matches!(protocol, tokens::Protocol::Tds7(version) if version >> 24 >= 0x74),
+                    tds::enclave::LengthEncoding::None,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        capture_protocol_artifact(
+                            &shared,
+                            peer,
+                            connection_id,
+                            Some(session_id),
+                            "rpc_parse_failure",
+                            &message,
+                            transport,
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
                 let outcome = handle_rpc(&mut session, &shared.config.personality, &rpc);
                 emit_request(
                     &shared,
@@ -812,7 +1189,34 @@ where
                     Event::new("rpc_request", Some(connection_id), Some(session_id))
                         .field("procedure", &rpc.procedure)
                         .field("options", rpc.options)
+                        .field(
+                            "enclave_package_bytes",
+                            rpc.batches
+                                .iter()
+                                .filter_map(|batch| batch.enclave_package_bytes)
+                                .sum::<usize>(),
+                        )
+                        .field("stream_headers", &rpc.headers)
+                        .field("batch_count", rpc.batches.len())
+                        .field(
+                            "procedures",
+                            rpc.batches
+                                .iter()
+                                .map(|batch| batch.procedure.as_str())
+                                .collect::<Vec<_>>(),
+                        )
                         .field("parameter_count", rpc.parameters.len())
+                        .field(
+                            "total_parameter_count",
+                            rpc.batches
+                                .iter()
+                                .map(|batch| batch.parameters.len())
+                                .sum::<usize>(),
+                        )
+                        .field(
+                            "no_execute_batch_count",
+                            rpc.batches.iter().filter(|batch| batch.no_execute).count(),
+                        )
                         .field(
                             "parameter_names",
                             rpc.parameters
@@ -829,28 +1233,266 @@ where
                         )
                         .field(
                             "output_parameter_count",
-                            rpc.parameters.iter().filter(|p| p.status & 1 != 0).count(),
+                            rpc.batches
+                                .iter()
+                                .flat_map(|batch| &batch.parameters)
+                                .filter(|p| p.status & 1 != 0)
+                                .count(),
+                        )
+                        .field(
+                            "encrypted_parameter_count",
+                            rpc.batches
+                                .iter()
+                                .flat_map(|batch| &batch.parameters)
+                                .filter(|p| p.encryption.is_some())
+                                .count(),
                         ),
                 );
                 (outcome, true)
             }
-            tds::ATTENTION => (
-                Outcome {
-                    classification: Classification::Unknown,
-                    risk_tags: vec![],
-                    result_sets: vec![],
-                    messages: vec![],
-                    error: None,
-                    state_changes: vec![],
-                    payload_candidate: None,
-                    honey_object: None,
-                },
-                false,
-            ),
+            tds::ATTENTION => {
+                if !message.payload.is_empty() {
+                    capture_protocol_artifact(
+                        &shared,
+                        peer,
+                        connection_id,
+                        Some(session_id),
+                        "malformed_attention",
+                        &message,
+                        transport,
+                    )
+                    .await;
+                    return Err(Error::Protocol(
+                        "ATTENTION message contains unexpected payload".into(),
+                    ));
+                }
+                shared.telemetry.emit(
+                    Event::new("attention", Some(connection_id), Some(session_id))
+                        .field("source_ip", peer.ip().to_string())
+                        .field("login", &session.login_name),
+                );
+                (empty_outcome(), false)
+            }
+            tds::TRANSACTION_MANAGER => {
+                progress.enter("transaction_manager_parse");
+                let request = match tds::transaction::parse_with_context(
+                    &message.payload,
+                    matches!(protocol, tokens::Protocol::Tds7(version) if version >> 24 >= 0x72),
+                    matches!(protocol, tokens::Protocol::Tds7(version) if version >> 24 >= 0x74),
+                    tds::enclave::LengthEncoding::None,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        capture_protocol_artifact(
+                            &shared,
+                            peer,
+                            connection_id,
+                            Some(session_id),
+                            "transaction_manager_parse_failure",
+                            &message,
+                            transport,
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
+                if request.operation == "unknown" {
+                    capture_protocol_artifact(
+                        &shared,
+                        peer,
+                        connection_id,
+                        Some(session_id),
+                        "unknown_transaction_manager_request",
+                        &message,
+                        transport,
+                    )
+                    .await;
+                }
+                shared.telemetry.emit(
+                    Event::new(
+                        "transaction_manager_request",
+                        Some(connection_id),
+                        Some(session_id),
+                    )
+                    .field("source_ip", peer.ip().to_string())
+                    .field("login", &session.login_name)
+                    .field("request_type", request.request_type)
+                    .field("operation", request.operation)
+                    .field("payload_bytes", request.payload_bytes)
+                    .field("isolation_level", request.isolation_level)
+                    .field("transaction_name", request.name)
+                    .field("begin_after", request.begin_after)
+                    .field("enclave_package_bytes", request.enclave_package_bytes)
+                    .field("stream_headers", &request.headers),
+                );
+                (empty_outcome(), false)
+            }
+            tds::BULK_LOAD => {
+                progress.enter("bulk_load_parse");
+                capture_protocol_artifact(
+                    &shared,
+                    peer,
+                    connection_id,
+                    Some(session_id),
+                    "bulk_load",
+                    &message,
+                    transport,
+                )
+                .await;
+                let wide_metadata = matches!(
+                    protocol,
+                    tokens::Protocol::Tds7(version) if version >> 24 >= 0x72
+                );
+                let bulk = match tds::bulk::parse_message(
+                    &message.payload,
+                    shared.config.limits.max_rpc_parameter_bytes,
+                    wide_metadata,
+                    10,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        shared.telemetry.emit(
+                            Event::new(
+                                "bulk_load_parse_failure",
+                                Some(connection_id),
+                                Some(session_id),
+                            )
+                            .field("source_ip", peer.ip().to_string())
+                            .field("login", &session.login_name)
+                            .field("message_bytes", message.payload.len())
+                            .field("error", error.to_string()),
+                        );
+                        return Err(error);
+                    }
+                };
+                match bulk {
+                    tds::bulk::BulkMessage::Bcp(bulk) => shared.telemetry.emit(
+                        Event::new("bulk_load", Some(connection_id), Some(session_id))
+                            .field("source_ip", peer.ip().to_string())
+                            .field("login", &session.login_name)
+                            .field("bulk_format", "bcp")
+                            .field("message_bytes", message.payload.len())
+                            .field("columns", &bulk.columns)
+                            .field("row_count", bulk.row_count)
+                            .field("sampled_rows", &bulk.sampled_rows)
+                            .field("done_status", bulk.done_status)
+                            .field("done_command", bulk.done_command)
+                            .field("declared_done_rows", bulk.declared_done_rows),
+                    ),
+                    tds::bulk::BulkMessage::UpdateText { data_bytes } => shared.telemetry.emit(
+                        Event::new("bulk_update_text", Some(connection_id), Some(session_id))
+                            .field("source_ip", peer.ip().to_string())
+                            .field("login", &session.login_name)
+                            .field("bulk_format", "update_text_write_text")
+                            .field("message_bytes", message.payload.len())
+                            .field("data_bytes", data_bytes),
+                    ),
+                }
+                (empty_outcome(), false)
+            }
+            tds::SSPI => {
+                let token = tds::sspi::parse(&message.payload);
+                shared.telemetry.emit(
+                    Event::new("sspi_message", Some(connection_id), Some(session_id))
+                        .field("source_ip", peer.ip().to_string())
+                        .field("token_family", token.family)
+                        .field("message_type", token.message_type)
+                        .field("token_bytes", token.bytes)
+                        .field("unexpected_state", true),
+                );
+                (empty_outcome(), false)
+            }
+            tds::FEDAUTH_TOKEN => {
+                let token = tds::fedauth::parse(&message.payload, false)?;
+                shared.telemetry.emit(
+                    Event::new(
+                        "federated_authentication_token",
+                        Some(connection_id),
+                        Some(session_id),
+                    )
+                    .field("source_ip", peer.ip().to_string())
+                    .field("token_bytes", token.token.len())
+                    .field("nonce_present", token.nonce.is_some())
+                    .field("unexpected_state", true),
+                );
+                (empty_outcome(), false)
+            }
+            tds::TDS5_NORMAL => {
+                capture_protocol_artifact(
+                    &shared,
+                    peer,
+                    connection_id,
+                    Some(session_id),
+                    "tds5_token_stream",
+                    &message,
+                    transport,
+                )
+                .await;
+                let auth = tds::tds5::parse_authentication(
+                    &message.payload,
+                    shared.config.limits.max_payload_bytes,
+                )?;
+                shared.telemetry.emit(
+                    Event::new(
+                        "tds5_authentication_stream",
+                        Some(connection_id),
+                        Some(session_id),
+                    )
+                    .field("source_ip", peer.ip().to_string())
+                    .field("login", &session.login_name)
+                    .field("message_types", auth.message_types)
+                    .field("parameter_formats", auth.parameter_formats)
+                    .field("parameter_sets", auth.parameter_sets)
+                    .field("parameter_value_bytes", auth.parameter_value_bytes)
+                    .field("commands", &auth.commands)
+                    .field("parameter_values", &auth.parameter_values)
+                    .field("unknown_token", auth.unknown_token)
+                    .field("trailing_bytes", auth.trailing_bytes),
+                );
+                let statements = auth
+                    .commands
+                    .iter()
+                    .filter_map(|command| {
+                        command.text.clone().or_else(|| {
+                            command
+                                .identifier
+                                .as_ref()
+                                .filter(|_| command.name == "dbrpc")
+                                .map(|name| format!("EXEC {name}"))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let outcome = if statements.is_empty() {
+                    empty_outcome()
+                } else {
+                    handle_sql(&mut session, &shared.config.personality, &statements)
+                };
+                (outcome, false)
+            }
             other => {
-                return Err(Error::Protocol(format!(
-                    "unsupported post-login TDS packet type 0x{other:02x}"
-                )));
+                capture_protocol_artifact(
+                    &shared,
+                    peer,
+                    connection_id,
+                    Some(session_id),
+                    "unhandled_packet_type",
+                    &message,
+                    transport,
+                )
+                .await;
+                shared.telemetry.emit(
+                    Event::new(
+                        "unhandled_tds_message",
+                        Some(connection_id),
+                        Some(session_id),
+                    )
+                    .field("source_ip", peer.ip().to_string())
+                    .field("packet_type", other)
+                    .field("packet_type_name", tds::packet_type_name(other))
+                    .field("message_bytes", message.payload.len()),
+                );
+                (empty_outcome(), false)
             }
         };
         update_risk(progress, outcome.classification);
@@ -869,40 +1511,429 @@ where
     }
 }
 
-async fn capture_login_message(
+#[allow(clippy::too_many_arguments)]
+async fn capture_protocol_artifact(
     shared: &Shared,
     peer: SocketAddr,
     connection_id: Uuid,
+    session_id: Option<u32>,
+    reason: &str,
     message: &tds::packet::Message,
     transport: &str,
 ) {
-    if !shared.config.payloads.captures_login_messages() {
+    if !shared.config.payloads.enabled || tds::is_authentication_packet(message.packet_type) {
         return;
     }
     match shared.payloads.capture(&message.payload).await {
+        Ok(Some(captured)) => {
+            shared
+                .metrics
+                .payloads_captured
+                .fetch_add(1, Ordering::Relaxed);
+            shared
+                .metrics
+                .bytes_captured
+                .fetch_add(captured.size as u64, Ordering::Relaxed);
+            shared.telemetry.emit(
+                Event::new("tds_message_artifact", Some(connection_id), session_id)
+                    .field("source_ip", peer.ip().to_string())
+                    .field("transport", transport)
+                    .field("reason", reason)
+                    .field("packet_type", message.packet_type)
+                    .field(
+                        "packet_type_name",
+                        tds::packet_type_name(message.packet_type),
+                    )
+                    .field("sha256", captured.sha256)
+                    .field("size", captured.size)
+                    .field("storage_id", captured.storage_id),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => shared.telemetry.emit(
+            Event::new(
+                "tds_message_artifact_error",
+                Some(connection_id),
+                session_id,
+            )
+            .field("source_ip", peer.ip().to_string())
+            .field("reason", reason)
+            .field("packet_type", message.packet_type)
+            .field("error", error.to_string()),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn negotiate_integrated_authentication<S>(
+    shared: &Shared,
+    stream: &mut MessageCaptureIo<S>,
+    peer: SocketAddr,
+    connection_id: Uuid,
+    session_id: u32,
+    progress: &mut Progress,
+    transport: &'static str,
+    protocol: tokens::Protocol,
+    initial_sspi: &[u8],
+) -> Result<Summary>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let initial = tds::sspi::parse(initial_sspi);
+    emit_sspi_message(
+        shared,
+        peer,
+        connection_id,
+        Some(session_id),
+        transport,
+        "login7",
+        &initial,
+    );
+    if initial.message_type == Some(1) && matches!(initial.family, "ntlmssp" | "spnego_ntlmssp") {
+        let challenge_id = Uuid::new_v4();
+        let mut challenge = [0_u8; 8];
+        challenge.copy_from_slice(&challenge_id.as_bytes()[..8]);
+        let ntlm = tds::sspi::ntlm_challenge(&shared.config.personality.server_name, challenge);
+        let response = tokens::sspi_challenge(&ntlm)?;
+        progress.enter("sspi_challenge_write");
+        write_message(stream, tds::TABULAR_RESULT, &response, 4096).await?;
+
+        progress.enter("sspi_read");
+        stream.clear_capture();
+        let continuation = match timeout(
+            shared.config.listener.login_timeout(),
+            read_message(
+                stream,
+                shared.config.limits.max_packet_bytes,
+                shared.config.limits.max_message_bytes,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(message)) => message,
+            Ok(Err(error)) => {
+                capture_incomplete_ingress(
+                    shared,
+                    peer,
+                    connection_id,
+                    Some(session_id),
+                    transport,
+                    stream.captured(),
+                    stream.truncated,
+                    error.kind(),
+                )
+                .await;
+                return Err(error);
+            }
+            Err(_) => {
+                capture_incomplete_ingress(
+                    shared,
+                    peer,
+                    connection_id,
+                    Some(session_id),
+                    transport,
+                    stream.captured(),
+                    stream.truncated,
+                    "timeout",
+                )
+                .await;
+                return Err(Error::Protocol("SSPI continuation timeout".into()));
+            }
+        };
+        progress.observe_message(&continuation);
+        observe_inbound_message(
+            shared,
+            peer,
+            connection_id,
+            Some(session_id),
+            "sspi_read",
+            transport,
+            &continuation,
+        )
+        .await;
+        progress.enter("sspi_parse");
+        if continuation.packet_type != tds::SSPI {
+            return Err(Error::Protocol(format!(
+                "expected SSPI continuation, received {}",
+                tds::packet_type_name(continuation.packet_type)
+            )));
+        }
+        let token = tds::sspi::parse(&continuation.payload);
+        emit_sspi_message(
+            shared,
+            peer,
+            connection_id,
+            Some(session_id),
+            transport,
+            "continuation",
+            &token,
+        );
+    }
+
+    progress.enter("login_response");
+    let response = tokens::login_failure(protocol, &shared.config.personality.server_name, false)?;
+    write_message(stream, tds::TABULAR_RESULT, &response, 4096).await?;
+    Ok(progress.summary("integrated_authentication_rejected"))
+}
+
+fn emit_sspi_message(
+    shared: &Shared,
+    peer: SocketAddr,
+    connection_id: Uuid,
+    session_id: Option<u32>,
+    transport: &str,
+    phase: &str,
+    token: &tds::sspi::SspiToken,
+) {
+    let mut event = Event::new("sspi_message", Some(connection_id), session_id)
+        .field("source_ip", peer.ip().to_string())
+        .field("transport", transport)
+        .field("phase", phase)
+        .field("token_family", token.family)
+        .field("message_type", token.message_type)
+        .field("token_bytes", token.bytes)
+        .field("parse_warnings", &token.parse_warnings);
+    if let Some(ntlm) = &token.ntlm {
+        event = event
+            .field("domain", &ntlm.domain)
+            .field("username", &ntlm.username)
+            .field("workstation", &ntlm.workstation)
+            .field("lm_response_bytes", ntlm.lm_response_bytes)
+            .field("nt_response_bytes", ntlm.nt_response_bytes)
+            .field("nt_response_variant", ntlm.nt_response_variant)
+            .field(
+                "encrypted_session_key_bytes",
+                ntlm.encrypted_session_key_bytes,
+            )
+            .field("negotiate_flags", ntlm.negotiate_flags);
+    }
+    shared.telemetry.emit(event);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn capture_incomplete_ingress(
+    shared: &Shared,
+    peer: SocketAddr,
+    connection_id: Uuid,
+    session_id: Option<u32>,
+    transport: &str,
+    wire_bytes: &[u8],
+    capture_truncated: bool,
+    error_kind: &str,
+) {
+    capture_incomplete_authentication_message(
+        shared,
+        peer,
+        connection_id,
+        session_id,
+        transport,
+        wire_bytes,
+        capture_truncated,
+        error_kind,
+    )
+    .await;
+    let Some(&first_byte) = wire_bytes.first() else {
+        return;
+    };
+    if tds::is_authentication_packet(first_byte) || !shared.config.payloads.enabled {
+        return;
+    }
+    let smp_frames = if first_byte == 0x53 {
+        match tds::smp::parse(wire_bytes, shared.config.limits.max_message_bytes) {
+            Ok(frames) => Some(frames),
+            Err(error) => {
+                shared.telemetry.emit(
+                    Event::new("smp_parse_failure", Some(connection_id), session_id)
+                        .field("source_ip", peer.ip().to_string())
+                        .field("transport", transport)
+                        .field("wire_bytes", wire_bytes.len())
+                        .field("error", error.to_string()),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    match shared.payloads.capture(wire_bytes).await {
+        Ok(Some(captured)) => {
+            shared
+                .metrics
+                .payloads_captured
+                .fetch_add(1, Ordering::Relaxed);
+            shared
+                .metrics
+                .bytes_captured
+                .fetch_add(captured.size as u64, Ordering::Relaxed);
+            shared.telemetry.emit(
+                Event::new(
+                    "incomplete_tds_message_capture",
+                    Some(connection_id),
+                    session_id,
+                )
+                .field("source_ip", peer.ip().to_string())
+                .field("transport", transport)
+                .field("first_byte", first_byte)
+                .field("smp_frames", smp_frames)
+                .field("error_kind", error_kind)
+                .field("capture_truncated", capture_truncated)
+                .field("sha256", captured.sha256)
+                .field("size", captured.size)
+                .field("storage_id", captured.storage_id),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => shared.telemetry.emit(
+            Event::new(
+                "tds_message_artifact_error",
+                Some(connection_id),
+                session_id,
+            )
+            .field("source_ip", peer.ip().to_string())
+            .field("reason", "incomplete_ingress")
+            .field("first_byte", first_byte)
+            .field("error", error.to_string()),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn capture_incomplete_authentication_message(
+    shared: &Shared,
+    peer: SocketAddr,
+    connection_id: Uuid,
+    session_id: Option<u32>,
+    transport: &str,
+    wire_bytes: &[u8],
+    capture_truncated: bool,
+    error_kind: &str,
+) {
+    let Some(&packet_type) = wire_bytes.first() else {
+        return;
+    };
+    if !tds::is_authentication_packet(packet_type)
+        || !shared.config.payloads.captures_login_messages()
+    {
+        return;
+    }
+    match shared.payloads.capture(wire_bytes).await {
         Ok(Some(captured)) => shared.telemetry.emit(
-            Event::new("login_message_capture", Some(connection_id), None)
+            Event::new(
+                "incomplete_authentication_message_capture",
+                Some(connection_id),
+                session_id,
+            )
+            .field("source_ip", peer.ip().to_string())
+            .field("transport", transport)
+            .field("packet_type", packet_type)
+            .field("packet_type_name", tds::packet_type_name(packet_type))
+            .field("wire_format", "tds_packets_with_headers")
+            .field("error_kind", error_kind)
+            .field("capture_truncated", capture_truncated)
+            .field("sha256", captured.sha256)
+            .field("size", captured.size)
+            .field("storage_id", captured.storage_id),
+        ),
+        Ok(None) => {}
+        Err(error) => shared.telemetry.emit(
+            Event::new(
+                "authentication_message_capture_error",
+                Some(connection_id),
+                session_id,
+            )
+            .field("source_ip", peer.ip().to_string())
+            .field("packet_type", packet_type)
+            .field("incomplete", true)
+            .field("error", error.to_string()),
+        ),
+    }
+}
+
+fn empty_outcome() -> Outcome {
+    Outcome {
+        classification: Classification::Unknown,
+        risk_tags: vec![],
+        result_sets: vec![],
+        messages: vec![],
+        error: None,
+        state_changes: vec![],
+        payload_candidate: None,
+        honey_object: None,
+    }
+}
+
+async fn observe_inbound_message(
+    shared: &Shared,
+    peer: SocketAddr,
+    connection_id: Uuid,
+    session_id: Option<u32>,
+    protocol_stage: &str,
+    transport: &str,
+    message: &tds::packet::Message,
+) {
+    let packet_type_name = tds::packet_type_name(message.packet_type);
+    shared.telemetry.emit(
+        Event::new("tds_message", Some(connection_id), session_id)
+            .field("source_ip", peer.ip().to_string())
+            .field("source_port", peer.port())
+            .field("protocol_stage", protocol_stage)
+            .field("transport", transport)
+            .field("packet_type", message.packet_type)
+            .field("packet_type_name", packet_type_name)
+            .field("packet_count", message.packet_count)
+            .field("first_packet_status", message.first_status)
+            .field("first_packet_id", message.first_packet_id)
+            .field("message_bytes", message.payload.len())
+            .field(
+                "authentication_message",
+                tds::is_authentication_packet(message.packet_type),
+            ),
+    );
+    if !tds::is_authentication_packet(message.packet_type)
+        || !shared.config.payloads.captures_login_messages()
+    {
+        return;
+    }
+    match shared.payloads.capture(&message.payload).await {
+        Ok(Some(captured)) => {
+            let login_message = matches!(message.packet_type, tds::LOGIN | tds::LOGIN7);
+            shared.telemetry.emit(
+                Event::new(
+                    if login_message {
+                        "login_message_capture"
+                    } else {
+                        "authentication_message_capture"
+                    },
+                    Some(connection_id),
+                    session_id,
+                )
                 .field("source_ip", peer.ip().to_string())
                 .field("transport", transport)
                 .field("packet_type", message.packet_type)
+                .field("packet_type_name", packet_type_name)
                 .field(
                     "login_format",
-                    if message.packet_type == tds::LOGIN {
+                    login_message.then_some(if message.packet_type == tds::LOGIN {
                         "tds42_login"
                     } else {
                         "login7"
-                    },
+                    }),
                 )
                 .field("sha256", captured.sha256)
                 .field("size", captured.size)
                 .field("storage_id", captured.storage_id),
-        ),
+            );
+        }
         Ok(None) => {}
         Err(error) => shared.telemetry.emit(
-            Event::new("login_message_capture_error", Some(connection_id), None)
-                .field("source_ip", peer.ip().to_string())
-                .field("packet_type", message.packet_type)
-                .field("error", error.to_string()),
+            Event::new(
+                "authentication_message_capture_error",
+                Some(connection_id),
+                session_id,
+            )
+            .field("source_ip", peer.ip().to_string())
+            .field("packet_type", message.packet_type)
+            .field("error", error.to_string()),
         ),
     }
 }

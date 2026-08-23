@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use metis_tds::tds::tokens::{self, ResultSet, SqlError};
+use metis_tds::tds::tokens::{self, Protocol, ResultSet, SqlError};
 
 fuzz_target!(|data: &[u8]| {
     let text = String::from_utf8_lossy(data.get(..data.len().min(4096)).unwrap_or(data));
@@ -37,8 +37,27 @@ fuzz_target!(|data: &[u8]| {
         message: text.into_owned(),
     };
 
-    let _ = tokens::response(&[result_set], &messages, None, "METIS", false);
-    let _ = tokens::response(&[], &messages, Some(&error), "METIS", true);
-    let _ = tokens::login_success("master", "us_english", 4096, &error.message);
-    let _ = tokens::login_failure("METIS", data.len() % 2 == 0);
+    for protocol in [
+        Protocol::Tds42,
+        Protocol::Tds7(0x7100_0001),
+        Protocol::Tds7(0x7400_0004),
+    ] {
+        let _ = tokens::response(
+            protocol,
+            std::slice::from_ref(&result_set),
+            &messages,
+            None,
+            "METIS",
+            false,
+        );
+        let _ = tokens::response(protocol, &[], &messages, Some(&error), "METIS", true);
+        let _ = tokens::login_success(
+            protocol,
+            "master",
+            "us_english",
+            4096,
+            &error.message,
+        );
+        let _ = tokens::login_failure(protocol, "METIS", data.len() % 2 == 0);
+    }
 });

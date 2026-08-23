@@ -7,6 +7,9 @@ pub const ENCRYPTION: u8 = 0x01;
 pub const INSTOPT: u8 = 0x02;
 pub const THREADID: u8 = 0x03;
 pub const MARS: u8 = 0x04;
+pub const TRACEID: u8 = 0x05;
+pub const FEDAUTHREQUIRED: u8 = 0x06;
+pub const NONCEOPT: u8 = 0x07;
 const TERMINATOR: u8 = 0xff;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,10 +42,23 @@ pub struct Prelogin {
     pub instance: Option<String>,
     pub thread_id: Option<u32>,
     pub mars: Option<bool>,
+    pub trace_id: Option<[u8; 36]>,
+    pub fedauth_required: Option<bool>,
+    pub nonce: Option<[u8; 32]>,
     pub unknown_tokens: Vec<u8>,
+    pub unknown_token_lengths: BTreeMap<u8, usize>,
+    pub parse_warnings: Vec<String>,
 }
 
 pub fn parse(payload: &[u8]) -> Result<Prelogin> {
+    parse_inner(payload, false)
+}
+
+pub fn parse_for_telemetry(payload: &[u8]) -> Result<Prelogin> {
+    parse_inner(payload, true)
+}
+
+fn parse_inner(payload: &[u8], tolerant: bool) -> Result<Prelogin> {
     let mut cursor = 0;
     let mut entries = BTreeMap::new();
     loop {
@@ -87,9 +103,11 @@ pub fn parse(payload: &[u8]) -> Result<Prelogin> {
             VERSION if value.len() == 6 => {
                 result.version = Some(value.try_into().expect("length checked"))
             }
-            ENCRYPTION if value.len() == 1 => {
-                result.encryption = Some(Encryption::parse(value[0])?)
-            }
+            ENCRYPTION if value.len() == 1 => match Encryption::parse(value[0]) {
+                Ok(encryption) => result.encryption = Some(encryption),
+                Err(error) if tolerant => result.parse_warnings.push(error.to_string()),
+                Err(error) => return Err(error),
+            },
             INSTOPT => {
                 result.instance = Some(
                     String::from_utf8_lossy(value)
@@ -103,12 +121,25 @@ pub fn parse(payload: &[u8]) -> Result<Prelogin> {
                 ))
             }
             MARS if value.len() == 1 => result.mars = Some(value[0] != 0),
-            VERSION | ENCRYPTION | THREADID | MARS => {
-                return Err(Error::Protocol(format!(
-                    "invalid PRELOGIN token length for {token}"
-                )));
+            TRACEID if value.len() == 36 => {
+                result.trace_id = Some(value.try_into().expect("length checked"))
             }
-            _ => result.unknown_tokens.push(token),
+            FEDAUTHREQUIRED if value.len() == 1 => result.fedauth_required = Some(value[0] != 0),
+            NONCEOPT if value.len() == 32 => {
+                result.nonce = Some(value.try_into().expect("length checked"))
+            }
+            VERSION | ENCRYPTION | THREADID | MARS | TRACEID | FEDAUTHREQUIRED | NONCEOPT => {
+                let error = Error::Protocol(format!("invalid PRELOGIN token length for {token}"));
+                if tolerant {
+                    result.parse_warnings.push(error.to_string());
+                } else {
+                    return Err(error);
+                }
+            }
+            _ => {
+                result.unknown_tokens.push(token);
+                result.unknown_token_lengths.insert(token, value.len());
+            }
         }
     }
     Ok(result)
@@ -195,5 +226,38 @@ mod tests {
         for length in 0..128 {
             let _ = parse(&vec![0xa5; length]);
         }
+    }
+
+    #[test]
+    fn parses_every_standard_prelogin_option() {
+        let values: [(u8, Vec<u8>); 8] = [
+            (VERSION, vec![16, 0, 16, 89, 0, 0]),
+            (ENCRYPTION, vec![Encryption::On as u8]),
+            (INSTOPT, b"MSSQLSERVER\0".to_vec()),
+            (THREADID, 42_u32.to_be_bytes().to_vec()),
+            (MARS, vec![1]),
+            (TRACEID, vec![2; 36]),
+            (FEDAUTHREQUIRED, vec![1]),
+            (NONCEOPT, vec![3; 32]),
+        ];
+        let table_len = values.len() * 5 + 1;
+        let mut payload = Vec::new();
+        let mut offset = table_len;
+        for (token, value) in &values {
+            payload.push(*token);
+            payload.extend_from_slice(&(offset as u16).to_be_bytes());
+            payload.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            offset += value.len();
+        }
+        payload.push(TERMINATOR);
+        for (_, value) in values {
+            payload.extend(value);
+        }
+        let parsed = parse(&payload).unwrap();
+        assert_eq!(parsed.thread_id, Some(42));
+        assert_eq!(parsed.mars, Some(true));
+        assert_eq!(parsed.trace_id, Some([2; 36]));
+        assert_eq!(parsed.fedauth_required, Some(true));
+        assert_eq!(parsed.nonce, Some([3; 32]));
     }
 }
