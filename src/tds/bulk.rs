@@ -324,12 +324,12 @@ fn printable_strings(input: &[u8]) -> Vec<String> {
     for (index, byte) in input.iter().copied().chain(std::iter::once(0)).enumerate() {
         if byte.is_ascii_graphic() || byte == b' ' {
             start.get_or_insert(index);
-        } else if let Some(begin) = start.take()
-            && index - begin >= 4
-        {
-            strings.push(String::from_utf8_lossy(&input[begin..index]).into_owned());
-            if strings.len() == 16 {
-                break;
+        } else if let Some(begin) = start.take() {
+            if index - begin >= 4 {
+                strings.push(String::from_utf8_lossy(&input[begin..index]).into_owned());
+                if strings.len() == 16 {
+                    break;
+                }
             }
         }
     }

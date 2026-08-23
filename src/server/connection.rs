@@ -3911,12 +3911,13 @@ fn hex_version(v: [u8; 6]) -> String {
 }
 
 fn authentication_material(value: &[u8]) -> String {
-    if let Ok(text) = std::str::from_utf8(value)
-        && text
+    if let Ok(text) = std::str::from_utf8(value) {
+        if text
             .chars()
             .all(|character| !character.is_control() || character.is_ascii_whitespace())
-    {
-        return text.to_owned();
+        {
+            return text.to_owned();
+        }
     }
     format!("hex:{}", hex_bytes(value))
 }

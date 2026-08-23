@@ -1029,12 +1029,13 @@ fn parse_session_state_data(mut input: &[u8]) -> Result<Vec<SessionStateValue>> 
 }
 
 fn telemetry_bytes(input: &[u8]) -> String {
-    if let Ok(text) = std::str::from_utf8(input)
-        && text
+    if let Ok(text) = std::str::from_utf8(input) {
+        if text
             .chars()
             .all(|character| !character.is_control() || character.is_ascii_whitespace())
-    {
-        return text.to_owned();
+        {
+            return text.to_owned();
+        }
     }
     let mut output = String::with_capacity(4 + input.len() * 2);
     output.push_str("hex:");

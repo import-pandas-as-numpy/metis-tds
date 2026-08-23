@@ -15,6 +15,7 @@ All notable user-visible changes are documented here. The project follows [Seman
 - Generate per-attempt RSA keypairs for non-nonce ASE password negotiation and reject a continuation whose message version does not match the negotiated handshake.
 - Emit ASE secure-login continuation telemetry before rejecting missing, mismatched, or undecryptable password material.
 - Elicit the published ASE proprietary-v1 secure-login exchange and retain its exact challenge key and response ciphertext without falsely claiming plaintext recovery for the unpublished cipher.
+- Use the AWS-LC backend for ASE RSA/OAEP operations, avoiding the network-observable timing weakness in the previously selected RSA implementation.
 - Classify complete and truncated ASE secure-login continuations by protocol stage so their raw artifacts follow the dedicated authentication-capture policy, and fingerprint encrypted-command packets for cross-capture analysis.
 - Accept both published ASE `DYNAMIC2` token assignments (`0x62` and `0xA3`).
 - Recover embedded TDS 5 authentication streams even when the surrounding LOGIN capability framing is missing or corrupt, and emit identity/security intent before a continuation handshake can time out.

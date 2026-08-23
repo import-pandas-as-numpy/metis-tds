@@ -809,10 +809,6 @@ async fn tds50_login_negotiates_capabilities_and_fields_a_language_token() {
 
 #[tokio::test]
 async fn tds50_secure_login_elicits_decrypts_and_records_the_password() {
-    use rand::rngs::OsRng;
-    use rsa::{Oaep, RsaPublicKey, pkcs1::DecodeRsaPublicKey};
-    use sha1::Sha1;
-
     let temp = tempfile::tempdir().unwrap();
     let telemetry_path = temp.path().join("events.jsonl");
     let payload_directory = temp.path().join("payloads");
@@ -839,12 +835,9 @@ async fn tds50_secure_login_elicits_decrypts_and_records_the_password() {
     assert_eq!(parsed.message_types[0].message_type, 30);
     assert_eq!(parsed.parameter_value_bytes.len(), 3);
     let pem = std::str::from_utf8(parsed.parameter_value(1).unwrap()).unwrap();
-    let public = RsaPublicKey::from_pkcs1_pem(pem).unwrap();
     let nonce = parsed.parameter_value(2).unwrap();
     let plaintext = [nonce, b"Summer2026!"].concat();
-    let ciphertext = public
-        .encrypt(&mut OsRng, Oaep::new::<Sha1>(), &plaintext)
-        .unwrap();
+    let ciphertext = encrypt_oaep_sha1_pem(pem, true, &plaintext);
 
     let mut continuation = vec![0x65, 3, 1, 31, 0];
     continuation.extend_from_slice(&[
@@ -893,10 +886,6 @@ async fn tds50_secure_login_elicits_decrypts_and_records_the_password() {
 
 #[tokio::test]
 async fn tds50_extended_v2_login_elicits_decrypts_and_records_the_password() {
-    use rand::rngs::OsRng;
-    use rsa::{Oaep, RsaPublicKey, pkcs8::DecodePublicKey};
-    use sha1::Sha1;
-
     let temp = tempfile::tempdir().unwrap();
     let telemetry_path = temp.path().join("events.jsonl");
     let mut config = Config::default();
@@ -920,10 +909,7 @@ async fn tds50_extended_v2_login_elicits_decrypts_and_records_the_password() {
     assert_eq!(parsed.message_types[0].message_type, 14);
     assert_eq!(parsed.parameter_values[0].value, "1");
     let public_pem = std::str::from_utf8(parsed.parameter_value(1).unwrap()).unwrap();
-    let public = RsaPublicKey::from_public_key_pem(public_pem).unwrap();
-    let ciphertext = public
-        .encrypt(&mut OsRng, Oaep::new::<Sha1>(), b"Password1")
-        .unwrap();
+    let ciphertext = encrypt_oaep_sha1_pem(public_pem, false, b"Password1");
 
     let mut continuation = vec![0x65, 3, 1, 15, 0];
     continuation.extend_from_slice(&[
@@ -1156,10 +1142,6 @@ async fn incomplete_tds50_secure_login_continuation_is_retained_as_authenticatio
 
 #[tokio::test]
 async fn tds50_epep_login_negotiates_nonce_and_records_the_password() {
-    use rand::rngs::OsRng;
-    use rsa::{Oaep, RsaPublicKey, pkcs1::DecodeRsaPublicKey};
-    use sha1::Sha1;
-
     let temp = tempfile::tempdir().unwrap();
     let telemetry_path = temp.path().join("events.jsonl");
     let mut config = Config::default();
@@ -1199,17 +1181,12 @@ async fn tds50_epep_login_negotiates_nonce_and_records_the_password() {
             .any(|message| message.message_type == 35)
     );
     let public_pem = std::str::from_utf8(parsed.parameter_value(1).unwrap()).unwrap();
-    let public = RsaPublicKey::from_pkcs1_pem(public_pem).unwrap();
     let nonce: [u8; 32] = parsed.parameter_value(2).unwrap().try_into().unwrap();
     let plaintext = [nonce.as_slice(), b"August2026!"].concat();
-    let ciphertext = public
-        .encrypt(&mut OsRng, Oaep::new::<Sha1>(), &plaintext)
-        .unwrap();
+    let ciphertext = encrypt_oaep_sha1_pem(public_pem, true, &plaintext);
     let symmetric_key = [0x6d; 32];
     let symmetric_plaintext = [nonce.as_slice(), symmetric_key.as_slice()].concat();
-    let symmetric_ciphertext = public
-        .encrypt(&mut OsRng, Oaep::new::<Sha1>(), &symmetric_plaintext)
-        .unwrap();
+    let symmetric_ciphertext = encrypt_oaep_sha1_pem(public_pem, true, &symmetric_plaintext);
 
     let mut continuation = vec![0x65, 3, 1, 31, 0];
     continuation.extend_from_slice(&[
@@ -1906,6 +1883,33 @@ async fn wait_for_events(path: &std::path::Path, event_type: &str) -> Vec<Value>
         }
     }
     panic!("timed out waiting for {event_type}");
+}
+
+fn encrypt_oaep_sha1_pem(pem: &str, pkcs1: bool, plaintext: &[u8]) -> Vec<u8> {
+    use aws_lc_rs::rsa::{
+        OAEP_SHA1_MGF1SHA1, OaepPublicEncryptingKey, PublicEncryptingKey, PublicKey,
+        PublicKeyComponents,
+    };
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let encoded = pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect::<String>();
+    let der = STANDARD.decode(encoded).unwrap();
+    let public = if pkcs1 {
+        let parsed = PublicKey::from_der(&der).unwrap();
+        let components = PublicKeyComponents::from(&parsed);
+        components.try_into().unwrap()
+    } else {
+        PublicEncryptingKey::from_der(&der).unwrap()
+    };
+    let public = OaepPublicEncryptingKey::new(public).unwrap();
+    let mut ciphertext = vec![0_u8; public.ciphertext_size()];
+    public
+        .encrypt(&OAEP_SHA1_MGF1SHA1, plaintext, &mut ciphertext, None)
+        .unwrap()
+        .to_vec()
 }
 
 fn login7(username: &str, password: &str, application: &str, database: &str) -> Vec<u8> {

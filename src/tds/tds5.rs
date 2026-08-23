@@ -1,13 +1,13 @@
 use std::sync::OnceLock;
 
-use rand::rngs::OsRng;
-use rsa::{
-    Oaep, RsaPrivateKey, RsaPublicKey,
-    pkcs1::EncodeRsaPublicKey,
-    pkcs8::{EncodePublicKey, LineEnding},
+use aws_lc_rs::{
+    encoding::{AsDer, Pkcs8V1Der, PublicKeyX509Der},
+    rsa::{KeyPair, KeySize, OAEP_SHA1_MGF1SHA1, OaepPrivateDecryptingKey, PrivateDecryptingKey},
+    signature::KeyPair as _,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use rand::rngs::OsRng;
 use serde::Serialize;
-use sha1::Sha1;
 
 use crate::tds::sspi;
 use crate::{Error, Result};
@@ -227,8 +227,9 @@ pub struct Tds5RemotePassword {
 }
 
 pub struct SecureLoginKey {
-    private: RsaPrivateKey,
+    private: OaepPrivateDecryptingKey,
     public_pem: String,
+    public_pkcs1_pem: String,
 }
 
 static SHARED_SECURE_LOGIN_KEY: OnceLock<std::result::Result<SecureLoginKey, String>> =
@@ -254,14 +255,34 @@ pub fn shared_secure_login_key() -> Result<&'static SecureLoginKey> {
 }
 
 fn generate_secure_login_key() -> std::result::Result<SecureLoginKey, String> {
-    let private = RsaPrivateKey::new(&mut OsRng, 2048).map_err(|error| error.to_string())?;
-    let public_pem = RsaPublicKey::from(&private)
-        .to_public_key_pem(LineEnding::LF)
-        .map_err(|error| error.to_string())?;
+    let key_pair = KeyPair::generate(KeySize::Rsa2048)
+        .map_err(|_| "AWS-LC RSA key generation failed".to_owned())?;
+    let private_der = AsDer::<Pkcs8V1Der<'static>>::as_der(&key_pair)
+        .map_err(|_| "AWS-LC RSA private-key encoding failed".to_owned())?;
+    let private = PrivateDecryptingKey::from_pkcs8(private_der.as_ref())
+        .map_err(|error| format!("AWS-LC rejected generated RSA key: {error}"))?;
+    let private = OaepPrivateDecryptingKey::new(private)
+        .map_err(|_| "AWS-LC RSA OAEP initialization failed".to_owned())?;
+    let public_der = AsDer::<PublicKeyX509Der<'static>>::as_der(key_pair.public_key())
+        .map_err(|_| "AWS-LC RSA public-key encoding failed".to_owned())?;
+    let public_pem = encode_pem("PUBLIC KEY", public_der.as_ref());
+    let public_pkcs1_pem = encode_pem("RSA PUBLIC KEY", key_pair.public_key().as_ref());
     Ok(SecureLoginKey {
         private,
         public_pem,
+        public_pkcs1_pem,
     })
+}
+
+fn encode_pem(label: &str, der: &[u8]) -> String {
+    let encoded = BASE64.encode(der);
+    let mut output = format!("-----BEGIN {label}-----\n");
+    for line in encoded.as_bytes().chunks(64) {
+        output.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+        output.push('\n');
+    }
+    output.push_str(&format!("-----END {label}-----\n"));
+    output
 }
 
 impl SecureLoginKey {
@@ -308,12 +329,7 @@ impl SecureLoginKey {
     }
 
     pub fn decrypt_password(&self, ciphertext: &[u8]) -> Result<String> {
-        let plaintext = self
-            .private
-            .decrypt(Oaep::new::<Sha1>(), ciphertext)
-            .map_err(|error| {
-                Error::Protocol(format!("invalid TDS 5 encrypted password: {error}"))
-            })?;
+        let plaintext = self.decrypt_oaep(ciphertext, "password")?;
         String::from_utf8(plaintext)
             .map_err(|_| Error::Protocol("TDS 5 encrypted password is not UTF-8".into()))
     }
@@ -327,15 +343,12 @@ impl SecureLoginKey {
                 "invalid nonce-bearing TDS 5 secure-login message type {message_type}"
             )));
         }
-        let public_pem = RsaPublicKey::from(&self.private)
-            .to_pkcs1_pem(LineEnding::LF)
-            .map_err(|error| Error::Protocol(format!("cannot encode TDS 5 RSA key: {error}")))?;
         let mut nonce = [0_u8; 32];
         use rand::RngCore as _;
         OsRng.fill_bytes(&mut nonce);
         let values = [
             SecureChallengeValue::Int(1),
-            SecureChallengeValue::Binary(public_pem.as_bytes()),
+            SecureChallengeValue::Binary(self.public_pkcs1_pem.as_bytes()),
             SecureChallengeValue::Binary(&nonce),
         ];
         Ok((secure_challenge(message_type, &values)?, nonce))
@@ -346,12 +359,7 @@ impl SecureLoginKey {
         ciphertext: &[u8],
         nonce: &[u8; 32],
     ) -> Result<String> {
-        let plaintext = self
-            .private
-            .decrypt(Oaep::new::<Sha1>(), ciphertext)
-            .map_err(|error| {
-                Error::Protocol(format!("invalid TDS 5 encrypted password: {error}"))
-            })?;
+        let plaintext = self.decrypt_oaep(ciphertext, "password")?;
         let password = plaintext.strip_prefix(nonce).ok_or_else(|| {
             Error::Protocol("TDS 5 encrypted password did not echo the server nonce".into())
         })?;
@@ -368,12 +376,7 @@ impl SecureLoginKey {
         ciphertext: &[u8],
         nonce: &[u8; 32],
     ) -> Result<[u8; 32]> {
-        let plaintext = self
-            .private
-            .decrypt(Oaep::new::<Sha1>(), ciphertext)
-            .map_err(|error| {
-                Error::Protocol(format!("invalid TDS 5 encrypted symmetric key: {error}"))
-            })?;
+        let plaintext = self.decrypt_oaep(ciphertext, "symmetric key")?;
         let key = plaintext.strip_prefix(nonce).ok_or_else(|| {
             Error::Protocol("TDS 5 encrypted symmetric key did not echo the server nonce".into())
         })?;
@@ -383,6 +386,14 @@ impl SecureLoginKey {
                 key.len()
             ))
         })
+    }
+
+    fn decrypt_oaep(&self, ciphertext: &[u8], material: &str) -> Result<Vec<u8>> {
+        let mut plaintext = vec![0_u8; self.private.min_output_size()];
+        self.private
+            .decrypt(&OAEP_SHA1_MGF1SHA1, ciphertext, &mut plaintext, None)
+            .map(|plaintext| plaintext.to_vec())
+            .map_err(|_| Error::Protocol(format!("invalid TDS 5 encrypted {material}")))
     }
 }
 
@@ -1741,10 +1752,10 @@ fn parse_exact_dbrpc2_name(input: &[u8]) -> Result<String> {
             .then(|| String::from_utf8_lossy(&input[prefix..prefix + length]).into_owned())
     }
 
-    if let Some(length) = input.first().copied().map(usize::from)
-        && let Some(name) = candidate(input, 1, length)
-    {
-        return Ok(name);
+    if let Some(length) = input.first().copied().map(usize::from) {
+        if let Some(name) = candidate(input, 1, length) {
+            return Ok(name);
+        }
     }
     if input.len() >= 2 {
         let length = usize::from(u16::from_le_bytes([input[0], input[1]]));
@@ -2217,7 +2228,30 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsa::pkcs1::DecodeRsaPublicKey;
+    use aws_lc_rs::rsa::{
+        OaepPublicEncryptingKey, PublicEncryptingKey, PublicKey, PublicKeyComponents,
+    };
+
+    fn encrypt_oaep_pem(pem: &str, pkcs1: bool, plaintext: &[u8]) -> Vec<u8> {
+        let encoded = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<String>();
+        let der = BASE64.decode(encoded).unwrap();
+        let public = if pkcs1 {
+            let parsed = PublicKey::from_der(&der).unwrap();
+            let components = PublicKeyComponents::from(&parsed);
+            components.try_into().unwrap()
+        } else {
+            PublicEncryptingKey::from_der(&der).unwrap()
+        };
+        let public = OaepPublicEncryptingKey::new(public).unwrap();
+        let mut ciphertext = vec![0_u8; public.ciphertext_size()];
+        public
+            .encrypt(&OAEP_SHA1_MGF1SHA1, plaintext, &mut ciphertext, None)
+            .unwrap()
+            .to_vec()
+    }
 
     #[test]
     fn every_published_ase_parameter_type_has_a_format_fixture() {
@@ -2584,14 +2618,8 @@ mod tests {
         assert_eq!(parsed.parameter_value_bytes.len(), 3);
         assert_eq!(parsed.parameter_value_bytes[2], 32);
 
-        let public_pem = RsaPublicKey::from(&key.private)
-            .to_pkcs1_pem(LineEnding::LF)
-            .unwrap();
-        let public = RsaPublicKey::from_pkcs1_pem(&public_pem).unwrap();
         let plaintext = [nonce.as_slice(), b"spring2027"].concat();
-        let encrypted = public
-            .encrypt(&mut OsRng, Oaep::new::<Sha1>(), &plaintext)
-            .unwrap();
+        let encrypted = encrypt_oaep_pem(&key.public_pkcs1_pem, true, &plaintext);
         assert_eq!(
             key.decrypt_password_with_nonce(&encrypted, &nonce).unwrap(),
             "spring2027"
@@ -3097,16 +3125,11 @@ mod tests {
 
     #[test]
     fn recovers_only_a_nonce_bound_32_byte_epep_symmetric_key() {
-        use rsa::RsaPublicKey;
-
         let server_key = secure_login_key().unwrap();
-        let public = RsaPublicKey::from(&server_key.private);
         let nonce = [0x3a; 32];
         let expected_key = [0x91; 32];
         let plaintext = [nonce.as_slice(), expected_key.as_slice()].concat();
-        let ciphertext = public
-            .encrypt(&mut OsRng, Oaep::new::<Sha1>(), &plaintext)
-            .unwrap();
+        let ciphertext = encrypt_oaep_pem(&server_key.public_pkcs1_pem, true, &plaintext);
 
         assert_eq!(
             server_key
@@ -3123,9 +3146,8 @@ mod tests {
         );
 
         let short_plaintext = [nonce.as_slice(), &[0x91; 31]].concat();
-        let short_ciphertext = public
-            .encrypt(&mut OsRng, Oaep::new::<Sha1>(), &short_plaintext)
-            .unwrap();
+        let short_ciphertext =
+            encrypt_oaep_pem(&server_key.public_pkcs1_pem, true, &short_plaintext);
         assert!(
             server_key
                 .decrypt_symmetric_key_with_nonce(&short_ciphertext, &nonce)
