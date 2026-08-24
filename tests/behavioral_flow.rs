@@ -58,6 +58,13 @@ async fn attacker_workflow_is_stateful_logged_and_never_executed() {
         .await
         .unwrap();
     client
+        .simple_query("CREATE ASSEMBLY ProbeCopy FROM 0x4d5a900003000000")
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
+    client
         .simple_query("SELECT * FROM dbo.DomainAdminCredentials")
         .await
         .unwrap()
@@ -98,5 +105,14 @@ async fn attacker_workflow_is_stateful_logged_and_never_executed() {
     assert!(!telemetry.contains("must-not-be-logged"));
     let payloads: Vec<_> = std::fs::read_dir(payload_path).unwrap().collect();
     assert_eq!(payloads.len(), 1);
+    let captures: Vec<serde_json::Value> = telemetry
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|event: &serde_json::Value| event["event_type"] == "payload_capture")
+        .collect();
+    assert_eq!(captures.len(), 2);
+    assert_eq!(captures[0]["duplicate"], false);
+    assert_eq!(captures[1]["duplicate"], true);
+    assert_eq!(captures[0]["storage_id"], captures[1]["storage_id"]);
     server_task.abort();
 }

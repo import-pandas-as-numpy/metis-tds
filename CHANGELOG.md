@@ -2,6 +2,12 @@
 
 All notable user-visible changes are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## 0.1.10 - 2026-08-23
+
+### Fixed
+
+- Store captured payloads once under their SHA-256 content address, atomically deduplicate concurrent observations, and mark repeated capture events without inflating stored-payload metrics.
+
 ## 0.1.9 - 2026-08-23
 
 ### Added

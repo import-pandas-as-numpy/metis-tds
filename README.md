@@ -14,7 +14,7 @@ Protocol behavior is implemented from the current Microsoft MS-TDS/MS-SSTDS spec
 
 ## Safety boundary
 
-Run this as an unprivileged, isolated service with outbound traffic denied. The runtime intentionally contains no subprocess or generic command-execution facility. Submitted binary material is bounded, hashed, and stored under generated names with mode `0600` when payload capture is enabled. Login-password and full-message capture are separately opt-in; captured credentials are attacker-supplied research data, never deployment credentials.
+Run this as an unprivileged, isolated service with outbound traffic denied. The runtime intentionally contains no subprocess or generic command-execution facility. Submitted binary material is bounded, SHA-256 content-addressed, deduplicated, and stored with mode `0600` when payload capture is enabled. Telemetry still records every observation and marks repeated content with `duplicate=true`. Login-password and full-message capture are separately opt-in; captured credentials are attacker-supplied research data, never deployment credentials.
 
 ## Quick start
 
@@ -41,13 +41,13 @@ TLS certificate conversion, systemd hardening, outbound-deny guidance, and Inter
 Release images for `linux/amd64` and `linux/arm64` are public and can be pulled anonymously from GHCR. Pin the reviewed release or, preferably, the manifest digest recorded by the registry:
 
 ```console
-docker pull ghcr.io/import-pandas-as-numpy/metis-tds:0.1.9
+docker pull ghcr.io/import-pandas-as-numpy/metis-tds:0.1.10
 docker run --read-only --cap-drop=ALL --security-opt=no-new-privileges \
   --tmpfs /tmp:rw,noexec,nosuid,size=16m \
   --mount type=bind,src="$PWD/config/local.json",dst=/etc/metis-tds/config.json,readonly \
   --mount type=volume,src=metis-tds-data,dst=/var/lib/metis-tds \
   --mount type=volume,src=metis-tds-logs,dst=/var/log/metis-tds \
-  -p 1433:1433 ghcr.io/import-pandas-as-numpy/metis-tds:0.1.9
+  -p 1433:1433 ghcr.io/import-pandas-as-numpy/metis-tds:0.1.10
 ```
 
 The image does not contain a deployment configuration. Supply one at runtime at `/etc/metis-tds/config.json`; for container networking its `listener.address` must use `0.0.0.0:1433`. Keep telemetry and captured-payload paths in the mounted data volumes. For an Internet-facing deployment, enable TLS and enforce outbound denial at the container or host network boundary.
