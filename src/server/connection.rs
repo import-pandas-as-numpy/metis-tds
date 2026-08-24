@@ -2501,14 +2501,16 @@ async fn capture_protocol_artifact(
     }
     match shared.payloads.capture(&message.payload).await {
         Ok(Some(captured)) => {
-            shared
-                .metrics
-                .payloads_captured
-                .fetch_add(1, Ordering::Relaxed);
-            shared
-                .metrics
-                .bytes_captured
-                .fetch_add(captured.size as u64, Ordering::Relaxed);
+            if captured.newly_stored {
+                shared
+                    .metrics
+                    .payloads_captured
+                    .fetch_add(1, Ordering::Relaxed);
+                shared
+                    .metrics
+                    .bytes_captured
+                    .fetch_add(captured.size as u64, Ordering::Relaxed);
+            }
             shared.telemetry.emit(
                 Event::new("tds_message_artifact", Some(connection_id), session_id)
                     .field("source_ip", peer.ip().to_string())
@@ -2530,6 +2532,7 @@ async fn capture_protocol_artifact(
                                 .count()
                         }),
                     )
+                    .field("duplicate", !captured.newly_stored)
                     .field("sha256", captured.sha256)
                     .field("size", captured.size)
                     .field("storage_id", captured.storage_id),
@@ -3428,14 +3431,16 @@ async fn capture_incomplete_ingress(
     }
     match shared.payloads.capture(wire_bytes).await {
         Ok(Some(captured)) => {
-            shared
-                .metrics
-                .payloads_captured
-                .fetch_add(1, Ordering::Relaxed);
-            shared
-                .metrics
-                .bytes_captured
-                .fetch_add(captured.size as u64, Ordering::Relaxed);
+            if captured.newly_stored {
+                shared
+                    .metrics
+                    .payloads_captured
+                    .fetch_add(1, Ordering::Relaxed);
+                shared
+                    .metrics
+                    .bytes_captured
+                    .fetch_add(captured.size as u64, Ordering::Relaxed);
+            }
             shared.telemetry.emit(
                 Event::new(
                     "incomplete_tds_message_capture",
@@ -3448,6 +3453,7 @@ async fn capture_incomplete_ingress(
                 .field("smp_frames", smp_frames)
                 .field("error_kind", error_kind)
                 .field("capture_truncated", capture_truncated)
+                .field("duplicate", !captured.newly_stored)
                 .field("sha256", captured.sha256)
                 .field("size", captured.size)
                 .field("storage_id", captured.storage_id),
@@ -3505,6 +3511,7 @@ async fn capture_incomplete_authentication_message(
             .field("wire_format", "tds_packets_with_headers")
             .field("error_kind", error_kind)
             .field("capture_truncated", capture_truncated)
+            .field("duplicate", !captured.newly_stored)
             .field("sha256", captured.sha256)
             .field("size", captured.size)
             .field("storage_id", captured.storage_id),
@@ -3649,6 +3656,7 @@ async fn capture_authentication_message(
                         "login7"
                     }),
                 )
+                .field("duplicate", !captured.newly_stored)
                 .field("sha256", captured.sha256)
                 .field("size", captured.size)
                 .field("storage_id", captured.storage_id),
@@ -3835,14 +3843,16 @@ async fn process_outcome(shared: &Shared, session: &SessionState, outcome: &Outc
     if let Some(candidate) = &outcome.payload_candidate {
         match shared.payloads.capture(&candidate.bytes).await {
             Ok(Some(captured)) => {
-                shared
-                    .metrics
-                    .payloads_captured
-                    .fetch_add(1, Ordering::Relaxed);
-                shared
-                    .metrics
-                    .bytes_captured
-                    .fetch_add(captured.size as u64, Ordering::Relaxed);
+                if captured.newly_stored {
+                    shared
+                        .metrics
+                        .payloads_captured
+                        .fetch_add(1, Ordering::Relaxed);
+                    shared
+                        .metrics
+                        .bytes_captured
+                        .fetch_add(captured.size as u64, Ordering::Relaxed);
+                }
                 shared.telemetry.emit(
                     Event::new(
                         "payload_capture",
@@ -3850,6 +3860,7 @@ async fn process_outcome(shared: &Shared, session: &SessionState, outcome: &Outc
                         Some(session.session_id),
                     )
                     .field("payload_type", &candidate.kind)
+                    .field("duplicate", !captured.newly_stored)
                     .field("sha256", captured.sha256)
                     .field("size", captured.size)
                     .field("storage_id", captured.storage_id),
